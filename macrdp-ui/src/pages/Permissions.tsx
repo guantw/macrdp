@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Monitor, MousePointer2, Mic, Check } from "lucide-react";
+import { Monitor, MousePointer2, Check } from "lucide-react";
 import { api } from "../lib/ipc";
 import type { PermissionStatus } from "../lib/types";
 
@@ -15,12 +15,6 @@ const permissionDefs = [
     name: "辅助功能",
     pane: "accessibility",
     icon: MousePointer2,
-  },
-  {
-    key: "microphone" as keyof PermissionStatus,
-    name: "麦克风",
-    pane: "microphone",
-    icon: Mic,
   },
 ];
 
@@ -39,8 +33,7 @@ function Permissions() {
 
   const allGranted =
     perms?.screen_capture === true &&
-    perms?.accessibility === true &&
-    perms?.microphone === true;
+    perms?.accessibility === true;
 
   return (
     <div className="flex flex-col gap-3 p-4">

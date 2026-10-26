@@ -7,7 +7,6 @@ pub fn check_permissions() -> PermissionStatus {
     PermissionStatus {
         screen_capture: macrdp_capture::check_screen_recording_permission(),
         accessibility: macrdp_input::check_accessibility_permission(),
-        microphone: false, // Phase 3
     }
 }
 

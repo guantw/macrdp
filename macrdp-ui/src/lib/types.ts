@@ -35,7 +35,6 @@ export interface LogEntry {
 export interface PermissionStatus {
   screen_capture: boolean;
   accessibility: boolean;
-  microphone: boolean;
 }
 
 export interface ConnectionHistory {

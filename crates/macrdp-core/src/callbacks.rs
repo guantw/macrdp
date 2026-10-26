@@ -82,7 +82,6 @@ pub struct LogEntry {
 pub struct PermissionStatus {
     pub screen_capture: bool,
     pub accessibility: bool,
-    pub microphone: bool,
 }
 
 /// Hot-updatable configuration
