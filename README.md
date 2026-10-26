@@ -1,7 +1,7 @@
 # macrdp
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)](https://www.rust-lang.org/)
 [![macOS](https://img.shields.io/badge/macOS-14%2B-black.svg)](https://www.apple.com/macos/)
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-Supported-green.svg)](#)
 
@@ -31,15 +31,17 @@
 ## 环境要求
 
 - **macOS 14+**（Sonoma 或更高版本，ScreenCaptureKit 所需）
-- **Rust 1.75+**
-- **完整 Xcode 15+**（仅 Command Line Tools 不够），并切换为活动开发者目录：
+- **Rust stable**（已验证 Rust 1.99.1；依赖的最低版本要求可能高于 workspace 声明的 1.75）
+- **Apple Command Line Tools 或完整 Xcode**，提供 Clang、macOS SDK 和 **Swift 5.9+**。完整 Xcode 不是必需；已使用 Command Line Tools 27、Swift 6.4 完成 CLI、GUI 和 DMG 构建。
+  可用以下只读命令检查当前工具链：
   ```bash
-  sudo xcode-select -s /Applications/Xcode.app
+  xcode-select -p
+  swift --version
+  xcrun --sdk macosx --show-sdk-path
   ```
-  `screencapturekit` crate 的 build.rs 会执行 `swift build --scratch-path`，需要 Xcode 自带的 Swift 5.7+。
-  不要使用 swiftly 安装的 Swift 5.5，也不要在 shell 里设置 `DYLD_LIBRARY_PATH` 指向 Xcode 的 `swift-5.5` 回溯部署库——它会污染 rustc / build script 子进程，导致 macOS 26 上 libdispatch 断言崩溃、`swift build` 链接失败或 `rustc -vV` 找不到 `libswiftCore.dylib`。
-- 屏幕录制权限（系统设置 > 隐私与安全性）
-- 辅助功能权限（用于键盘鼠标注入）
+  屏幕采集依赖通过 Swift Package Manager 编译，因此需要可用的 `swift build`，而不是仅存在 `xcodebuild` 命令。不要将 `DYLD_LIBRARY_PATH` 指向旧版 Swift 回溯部署库，以免干扰 Rust 和 Swift 子进程。
+- **Node.js 和 npm**（GUI 构建需要；已验证 Node.js 22、npm 10）
+- 运行时需要屏幕录制权限（系统设置 > 隐私与安全性）和辅助功能权限（键盘鼠标注入）
 
 ---
 

@@ -1,7 +1,7 @@
 # macrdp
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)](https://www.rust-lang.org/)
 [![macOS](https://img.shields.io/badge/macOS-14%2B-black.svg)](https://www.apple.com/macos/)
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-Supported-green.svg)](#)
 
@@ -31,15 +31,17 @@ A native RDP server for macOS. Remote into your Mac from Windows, Linux, iOS, or
 ## Requirements
 
 - **macOS 14+** (Sonoma or later, required by ScreenCaptureKit)
-- **Rust 1.75+**
-- **Full Xcode 15+** (Command Line Tools alone is not enough), selected as the active developer directory:
+- **Rust stable** (verified with Rust 1.99.1; dependencies may require a newer compiler than the workspace's declared 1.75)
+- **Apple Command Line Tools or full Xcode**, providing Clang, the macOS SDK, and **Swift 5.9+**. Full Xcode is not required; CLI, GUI, and DMG builds have been verified with Command Line Tools 27 and Swift 6.4.
+  Inspect the active toolchain with these read-only commands:
   ```bash
-  sudo xcode-select -s /Applications/Xcode.app
+  xcode-select -p
+  swift --version
+  xcrun --sdk macosx --show-sdk-path
   ```
-  The `screencapturekit` crate's build.rs runs `swift build --scratch-path`, which needs the Swift 5.7+ toolchain bundled with Xcode.
-  Do not use a swiftly-installed Swift 5.5, and do not set `DYLD_LIBRARY_PATH` to Xcode's `swift-5.5` back-deploy libraries in your shell: it leaks into rustc / build-script subprocesses and causes libdispatch assertion crashes on macOS 26, `swift build` link failures, or `rustc -vV` failing to find `libswiftCore.dylib`.
-- Screen Recording permission (System Settings > Privacy & Security)
-- Accessibility permission (for keyboard/mouse injection)
+  The screen capture dependency builds through Swift Package Manager, so `swift build` must work; the presence of an `xcodebuild` command alone is insufficient. Do not point `DYLD_LIBRARY_PATH` at old Swift back-deployment libraries, which can interfere with Rust and Swift subprocesses.
+- **Node.js and npm** (required for GUI builds; verified with Node.js 22 and npm 10)
+- Runtime permissions: Screen Recording (System Settings > Privacy & Security) and Accessibility (keyboard/mouse injection)
 
 ---
 
