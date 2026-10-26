@@ -228,13 +228,45 @@ pub async fn start_server_with_perf(
 ) -> Result<Arc<ServerHandle>> {
     let handler: Arc<dyn ServerEventHandler> = Arc::new(handler);
 
-    // Notify handler: starting
+    with_startup_status(
+        handler.as_ref(),
+        start_server_inner(config, Arc::clone(&handler), perf_stats),
+    )
+    .await
+}
+
+/// Always complete the starting state, including failures before a handle exists.
+async fn with_startup_status<T>(
+    handler: &dyn ServerEventHandler,
+    startup: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
     handler.on_status_change(ServerStatus {
         running: true,
         state: "starting".to_string(),
         uptime_secs: 0,
     });
 
+    let result = startup.await;
+    let (running, state) = match &result {
+        Ok(_) => (true, "running"),
+        Err(error) => {
+            tracing::error!("Failed to start server: {error:#}");
+            (false, "error")
+        }
+    };
+    handler.on_status_change(ServerStatus {
+        running,
+        state: state.to_string(),
+        uptime_secs: 0,
+    });
+    result
+}
+
+async fn start_server_inner(
+    config: ServerConfig,
+    handler: Arc<dyn ServerEventHandler>,
+    perf_stats: Option<SharedPerfStats>,
+) -> Result<Arc<ServerHandle>> {
     // Check and request permissions
     let perms = permissions::request_permissions();
     tracing::info!(?perms, "Permission status");
@@ -393,13 +425,6 @@ pub async fn start_server_with_perf(
         config_tx,
     });
 
-    // Notify handler: running
-    handler.on_status_change(ServerStatus {
-        running: true,
-        state: "running".to_string(),
-        uptime_secs: 0,
-    });
-
     Ok(handle)
 }
 
@@ -427,7 +452,7 @@ fn run_server_thread(args: ServerThreadArgs) {
                 tracing::error!("Failed to load TLS certificate: {e}");
                 args.handler.on_status_change(ServerStatus {
                     running: false,
-                    state: format!("error: {e}"),
+                    state: "error".to_string(),
                     uptime_secs: 0,
                 });
                 return;
@@ -439,7 +464,7 @@ fn run_server_thread(args: ServerThreadArgs) {
                 tracing::error!("Failed to create TLS acceptor: {e}");
                 args.handler.on_status_change(ServerStatus {
                     running: false,
-                    state: format!("error: {e}"),
+                    state: "error".to_string(),
                     uptime_secs: 0,
                 });
                 return;
@@ -610,7 +635,7 @@ fn run_server_thread(args: ServerThreadArgs) {
                     tracing::error!("RDP server error: {e}");
                     args.handler.on_status_change(ServerStatus {
                         running: false,
-                        state: format!("error: {e}"),
+                        state: "error".to_string(),
                         uptime_secs: 0,
                     });
                 }
@@ -620,4 +645,47 @@ fn run_server_thread(args: ServerThreadArgs) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct StatusRecorder(Mutex<Vec<ServerStatus>>);
+
+    impl ServerEventHandler for StatusRecorder {
+        fn on_status_change(&self, status: ServerStatus) {
+            self.0.lock().unwrap().push(status);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_reports_success_or_failure_instead_of_remaining_starting() {
+        for succeeds in [true, false] {
+            let handler = StatusRecorder::default();
+            let result = with_startup_status(&handler, async {
+                if succeeds {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("certificate directory is not writable"))
+                }
+            })
+            .await;
+
+            let statuses = handler.0.lock().unwrap();
+            assert_eq!(statuses.len(), 2);
+            assert_eq!(statuses[0].state, "starting");
+            assert_eq!(statuses[1].running, succeeds);
+            assert_eq!(statuses[1].state, if succeeds { "running" } else { "error" });
+            if succeeds {
+                result.unwrap();
+            } else {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "certificate directory is not writable"
+                );
+            }
+        }
+    }
 }

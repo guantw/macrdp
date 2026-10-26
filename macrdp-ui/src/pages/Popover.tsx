@@ -1,4 +1,3 @@
-import { useState } from "react";
 import {
   Settings,
   LogOut,
@@ -6,6 +5,7 @@ import {
   Play,
   Square,
   Monitor,
+  Loader2,
 } from "lucide-react";
 import { useServerStatus } from "../hooks/useServerStatus";
 import { useMetrics } from "../hooks/useMetrics";
@@ -18,30 +18,28 @@ import { Separator } from "@/components/ui/separator";
 const statusDotColor: Record<string, string> = {
   running: "bg-green",
   starting: "bg-accent",
+  stopping: "bg-accent",
   stopped: "bg-muted-foreground",
   error: "bg-destructive",
 };
 
 function Popover() {
-  const status = useServerStatus();
+  const { status, startServer, stopServer } = useServerStatus();
   const { metrics, stale } = useMetrics();
   const connections = useConnections();
-  const [toggling, setToggling] = useState(false);
 
   const metricsAvailable = metrics && !stale;
+  const transitioning = status.state === "starting" || status.state === "stopping";
 
   const handleToggle = async () => {
-    setToggling(true);
     try {
       if (status.running) {
-        await api.stopServer();
+        await stopServer();
       } else {
-        await api.startServer();
+        await startServer();
       }
     } catch (err) {
       console.error("Failed to toggle server:", err);
-    } finally {
-      setToggling(false);
     }
   };
 
@@ -74,7 +72,7 @@ function Popover() {
             <span className="text-sm font-semibold text-foreground">
               macrdp
             </span>
-            {status.running && status.uptime_secs > 0 && (
+            {status.state === "running" && status.uptime_secs > 0 && (
               <span className="text-xs text-muted-foreground">
                 {formatDuration(status.uptime_secs)}
               </span>
@@ -198,11 +196,13 @@ function Popover() {
           <Button
             variant={status.running ? "destructive" : "default"}
             size="sm"
-            disabled={toggling || status.state === "starting"}
+            disabled={transitioning}
             onClick={handleToggle}
-            className="w-full"
+            className="w-full disabled:bg-muted disabled:text-muted-foreground"
           >
-            {status.running ? (
+            {transitioning ? (
+              <><Loader2 className="h-3 w-3 animate-spin" /> {status.state === "starting" ? "启动中..." : "停止中..."}</>
+            ) : status.running ? (
               <><Square className="h-3 w-3" /> 停止</>
             ) : (
               <><Play className="h-3 w-3" /> 启动</>

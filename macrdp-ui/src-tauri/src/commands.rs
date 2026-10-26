@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::database::Database;
 use crate::event_bridge::TauriEventBridge;
-use crate::state::AppState;
+use crate::state::{AppState, ServerStatus};
 
 /// Response from `set_config` indicating whether the server must be restarted.
 #[derive(Debug, Clone, Serialize)]
@@ -20,16 +20,14 @@ pub struct SetConfigResponse {
 pub async fn start_server(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<ServerStatus, String> {
     tracing::info!("start_server called");
 
-    // Check if already running
-    {
-        let guard = state.server_handle.lock().await;
-        if guard.is_some() {
-            tracing::info!("Server already running");
-            return Ok(());
-        }
+    // Serialize the full operation so two windows cannot start duplicate servers.
+    let mut guard = state.server_handle.lock().await;
+    if guard.is_some() {
+        tracing::info!("Server already running");
+        return Ok(state.status.lock().unwrap().clone());
     }
 
     // Load configuration from UI config
@@ -41,54 +39,54 @@ pub async fn start_server(
     // Start the server in-process
     let handle = macrdp_core::start_server(config, bridge)
         .await
-        .map_err(|e| format!("Failed to start server: {}", e))?;
+        .map_err(|e| format!("Failed to start server: {e:#}"))?;
 
     let port = handle.port();
     tracing::info!(port, "Server started successfully");
 
     // Store the handle
-    {
-        let mut guard = state.server_handle.lock().await;
-        *guard = Some(handle);
-    }
+    *guard = Some(handle);
 
     // Emit status update
-    let status = state.status.lock().await.clone();
+    let status = state.status.lock().unwrap().clone();
     let _ = app.emit("server-status", &status);
 
-    Ok(())
+    Ok(status)
 }
 
 #[tauri::command]
 pub async fn stop_server(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<ServerStatus, String> {
     tracing::info!("stop_server called");
 
-    // Take the handle out
-    let handle = {
-        let mut guard = state.server_handle.lock().await;
-        guard.take()
-    };
-
-    if let Some(handle) = handle {
+    let mut guard = state.server_handle.lock().await;
+    if let Some(handle) = guard.as_ref() {
+        let stopping = ServerStatus {
+            running: true,
+            state: "stopping".to_string(),
+            uptime_secs: handle.status().uptime_secs,
+        };
+        *state.status.lock().unwrap() = stopping.clone();
+        let _ = app.emit("server-status", &stopping);
         handle
             .stop()
             .await
             .map_err(|e| format!("Failed to stop server: {}", e))?;
     }
+    *guard = None;
 
     // Update status
     {
-        let mut status = state.status.lock().await;
+        let mut status = state.status.lock().unwrap();
         status.running = false;
         status.state = "stopped".to_string();
         status.uptime_secs = 0;
     }
     let _ = app.emit(
         "server-status",
-        &*state.status.lock().await,
+        &*state.status.lock().unwrap(),
     );
 
     // Clear metrics and connections
@@ -101,23 +99,25 @@ pub async fn stop_server(
         connections.clear();
     }
 
-    Ok(())
+    Ok(state.status.lock().unwrap().clone())
 }
 
 #[tauri::command]
 pub async fn get_server_status(
     state: State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
-    // If we have a live handle, refresh from it
+    // Pending operations publish their own state; status queries must not wait for them.
     {
-        let guard = state.server_handle.lock().await;
-        if let Some(ref handle) = *guard {
-            let live_status = handle.status();
-            let mut status = state.status.lock().await;
-            *status = live_status;
+        if let Ok(guard) = state.server_handle.try_lock() {
+            if let Some(ref handle) = *guard {
+                let mut status = state.status.lock().unwrap();
+                if status.state != "starting" && status.state != "stopping" {
+                    *status = handle.status();
+                }
+            }
         }
     }
-    let status = state.status.lock().await.clone();
+    let status = state.status.lock().unwrap().clone();
     serde_json::to_value(&status).map_err(|e| e.to_string())
 }
 

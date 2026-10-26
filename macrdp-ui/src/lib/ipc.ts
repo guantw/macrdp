@@ -11,8 +11,8 @@ import type {
 } from "./types";
 
 export const api = {
-  startServer: () => invoke<void>("start_server"),
-  stopServer: () => invoke<void>("stop_server"),
+  startServer: () => invoke<ServerStatus>("start_server"),
+  stopServer: () => invoke<ServerStatus>("stop_server"),
   getServerStatus: () => invoke<ServerStatus>("get_server_status"),
   getMetrics: () => invoke<Metrics>("get_metrics"),
   getConnections: () => invoke<Connection[]>("get_connections"),

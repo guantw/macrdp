@@ -1,1 +1,1 @@
-{}
+{"server-events":{"identifier":"server-events","description":"Allow the main and tray windows to receive live server updates.","local":true,"windows":["main","popover"],"permissions":["core:event:allow-listen","core:event:allow-unlisten"]}}

@@ -13,13 +13,12 @@ import EmptyState from "../components/EmptyState";
 import type { UiConfig } from "../lib/types";
 
 function Dashboard() {
-  const status = useServerStatus();
+  const { status, startServer, stopServer } = useServerStatus();
   const { metrics, stale } = useMetrics();
   const connections = useConnections();
-  const [loading, setLoading] = useState(false);
   const [config, setConfig] = useState<UiConfig | null>(null);
 
-  const metricsAvailable = status.running && metrics && !stale;
+  const metricsAvailable = status.state === "running" && metrics && !stale;
   const bitrateHistory = useMetricHistory(
     metricsAvailable ? metrics.bitrate_kbps / 1000 : null
   );
@@ -32,37 +31,19 @@ function Dashboard() {
     api.getConfig().then(setConfig).catch(console.error);
   }, []);
 
-  // Clear loading when backend state actually changes
-  useEffect(() => {
-    if (loading && (status.state === "running" || status.state === "error")) {
-      setLoading(false);
-    }
-    if (loading && status.state === "stopped" && !status.running) {
-      // stopServer completed
-      const timer = setTimeout(() => setLoading(false), 500);
-      return () => clearTimeout(timer);
-    }
-  }, [status.state, status.running, loading]);
-
   const handleStart = async () => {
-    if (loading) return;
-    setLoading(true);
     try {
-      await api.startServer();
+      await startServer();
     } catch (err: unknown) {
       console.error("Failed to start server:", err);
-      setLoading(false);
     }
   };
 
   const handleStop = async () => {
-    if (loading) return;
-    setLoading(true);
     try {
-      await api.stopServer();
+      await stopServer();
     } catch (err: unknown) {
       console.error("Failed to stop server:", err);
-      setLoading(false);
     }
   };
 
@@ -80,7 +61,6 @@ function Dashboard() {
     <div className="flex flex-col gap-3 p-4 overflow-y-auto">
       <StatusBar
         state={status.state}
-        loading={loading}
         port={port}
         uptimeSeconds={status.uptime_secs}
         onStart={handleStart}

@@ -1,9 +1,8 @@
-import { useRef, useCallback } from "react";
 import { Play, Square, Loader2 } from "lucide-react";
+import type { ServerStatus } from "../lib/types";
 
 interface StatusBarProps {
-  state: "running" | "starting" | "stopped" | "error";
-  loading?: boolean;
+  state: ServerStatus["state"];
   port?: number;
   uptimeSeconds?: number;
   errorMessage?: string;
@@ -33,6 +32,11 @@ const statusConfig: Record<
     glowColor: "0 0 6px var(--color-yellow)",
     label: "启动中...",
   },
+  stopping: {
+    dotClass: "bg-yellow",
+    glowColor: "0 0 6px var(--color-yellow)",
+    label: "停止中...",
+  },
   stopped: {
     dotClass: "bg-text-muted",
     glowColor: "none",
@@ -45,11 +49,8 @@ const statusConfig: Record<
   },
 };
 
-const DEBOUNCE_MS = 1500;
-
 function StatusBar({
   state,
-  loading = false,
   port,
   uptimeSeconds,
   errorMessage,
@@ -58,20 +59,8 @@ function StatusBar({
 }: StatusBarProps) {
   const config = statusConfig[state];
   const isError = state === "error";
-  const isLoading = loading || state === "starting";
-  const showStop = state === "running" || state === "starting" || (loading && state !== "stopped");
-  const buttonsDisabled = isLoading;
-  const lastClickRef = useRef(0);
-
-  const debounced = useCallback(
-    (fn: () => void) => {
-      const now = Date.now();
-      if (now - lastClickRef.current < DEBOUNCE_MS) return;
-      lastClickRef.current = now;
-      fn();
-    },
-    []
-  );
+  const isLoading = state === "starting" || state === "stopping";
+  const showStop = state === "running" || state === "stopping";
 
   const wrapperClass = isError
     ? "flex items-center h-9 bg-red/10 border border-red/20 rounded-[8px] px-3"
@@ -104,29 +93,29 @@ function StatusBar({
       <div className="shrink-0 ml-2">
         {showStop ? (
           <button
-            onClick={() => debounced(onStop)}
-            disabled={buttonsDisabled}
-            className="inline-flex items-center gap-1.5 rounded-md bg-red/10 px-2.5 py-1 text-xs font-medium text-red hover:bg-red/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            onClick={onStop}
+            disabled={isLoading}
+            className="inline-flex items-center gap-1.5 rounded-md bg-red/10 px-2.5 py-1 text-xs font-medium text-red hover:bg-red/20 transition-colors disabled:bg-border disabled:text-text-muted disabled:cursor-not-allowed"
           >
             {isLoading ? (
               <Loader2 className="h-3 w-3 animate-spin" />
             ) : (
               <Square className="h-3 w-3" />
             )}
-            {isLoading ? "处理中..." : "停止"}
+            {isLoading ? "停止中..." : "停止"}
           </button>
         ) : (
           <button
-            onClick={() => debounced(onStart)}
-            disabled={buttonsDisabled}
-            className="inline-flex items-center gap-1.5 rounded-md bg-green/10 px-2.5 py-1 text-xs font-medium text-green hover:bg-green/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            onClick={onStart}
+            disabled={isLoading}
+            className="inline-flex items-center gap-1.5 rounded-md bg-green/10 px-2.5 py-1 text-xs font-medium text-green hover:bg-green/20 transition-colors disabled:bg-border disabled:text-text-muted disabled:cursor-not-allowed"
           >
             {isLoading ? (
               <Loader2 className="h-3 w-3 animate-spin" />
             ) : (
               <Play className="h-3 w-3" />
             )}
-            {isLoading ? "处理中..." : "启动"}
+            {isLoading ? "启动中..." : "启动"}
           </button>
         )}
       </div>

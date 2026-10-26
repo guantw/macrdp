@@ -1,8 +1,8 @@
 //! Bridge between macrdp-core's ServerEventHandler callbacks and Tauri state/events.
 //!
 //! The ServerEventHandler callbacks are called from sync context (server/metrics thread).
-//! Since AppState uses tokio::sync::Mutex, we use tokio::spawn to bridge sync→async
-//! for operations that need async locks. Tray updates are sync and can be called directly.
+//! Status transitions are applied synchronously so a queued "starting" update cannot
+//! overwrite a completed start. Other state uses tokio::spawn for async locks.
 
 use std::sync::Arc;
 
@@ -31,15 +31,10 @@ impl TauriEventBridge {
 
 impl ServerEventHandler for TauriEventBridge {
     fn on_status_change(&self, status: ServerStatus) {
-        let app = self.app.clone();
-        let status_clone = status.clone();
-        tokio::spawn(async move {
-            if let Some(state) = app.try_state::<Arc<AppState>>() {
-                let mut guard = state.status.lock().await;
-                *guard = status_clone.clone();
-            }
-            let _ = app.emit("server-status", &status_clone);
-        });
+        if let Some(state) = self.app.try_state::<Arc<AppState>>() {
+            *state.status.lock().unwrap() = status.clone();
+        }
+        let _ = self.app.emit("server-status", &status);
     }
 
     fn on_metrics(&self, metrics: Metrics) {
