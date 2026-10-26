@@ -143,8 +143,12 @@ impl ServerConfig {
 
 /// Returns the macrdp config directory.
 /// Search order: ./ -> ~/.config/macrdp -> ~/Library/Application Support/macrdp
+/// Without an existing config, use the user config directory for generated files.
 pub fn config_dir() -> PathBuf {
-    let candidates = config_dir_candidates();
+    select_config_dir(config_dir_candidates())
+}
+
+fn select_config_dir(candidates: Vec<PathBuf>) -> PathBuf {
     for dir in &candidates {
         if dir.join("config.toml").exists() {
             return dir.clone();
@@ -152,7 +156,7 @@ pub fn config_dir() -> PathBuf {
     }
     candidates
         .into_iter()
-        .next()
+        .last()
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
@@ -175,6 +179,26 @@ fn config_dir_candidates() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_config_dir_defaults_to_user_storage_and_preserves_search_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let working = temp.path().join("working");
+        let legacy = temp.path().join("legacy-user-config");
+        let native = temp.path().join("native-user-config");
+        let candidates = vec![working.clone(), legacy.clone(), native.clone()];
+
+        // A GUI launch can have an unwritable working directory. New files belong
+        // in user storage even when no config file or directory exists yet.
+        assert_eq!(select_config_dir(candidates.clone()), native);
+
+        // Existing configs retain their documented precedence.
+        for expected in [&native, &legacy, &working] {
+            std::fs::create_dir_all(expected).unwrap();
+            std::fs::write(expected.join("config.toml"), "port = 13389").unwrap();
+            assert_eq!(select_config_dir(candidates.clone()), *expected);
+        }
+    }
 
     #[test]
     fn test_default_config() {

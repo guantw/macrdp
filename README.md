@@ -92,6 +92,10 @@ log_level = "info"          # trace / debug / info / warn / error
 2. `~/.config/macrdp/config.toml`
 3. `~/Library/Application Support/macrdp/config.toml`
 
+默认生成的 TLS 证书保存在所选配置目录的 `tls/` 下；没有找到配置文件时，使用用户配置目录（macOS 为 `~/Library/Application Support/macrdp`），不向应用启动时的工作目录写入证书。
+
+GUI 设置独立保存在 `~/.macrdp/config-ui.toml`。
+
 ---
 
 ## 项目结构

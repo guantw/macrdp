@@ -92,6 +92,10 @@ Config search order:
 2. `~/.config/macrdp/config.toml`
 3. `~/Library/Application Support/macrdp/config.toml`
 
+Generated TLS certificates default to `tls/` inside the selected config directory. When no config file is found, the user config directory is used (`~/Library/Application Support/macrdp` on macOS), rather than the application's launch working directory.
+
+GUI settings are stored separately in `~/.macrdp/config-ui.toml`.
+
 ---
 
 ## Project Structure
