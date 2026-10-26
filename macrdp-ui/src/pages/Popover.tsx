@@ -1,3 +1,7 @@
+import { useEffect, useRef, useState } from "react";
+import { AlertDialog } from "@base-ui/react/alert-dialog";
+import { LogicalSize } from "@tauri-apps/api/dpi";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Settings,
   LogOut,
@@ -27,6 +31,24 @@ function Popover() {
   const { status, startServer, stopServer } = useServerStatus();
   const { metrics, stale } = useMetrics();
   const connections = useConnections();
+  const [quitting, setQuitting] = useState(false);
+  const [quitError, setQuitError] = useState<string | null>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const content = contentRef.current;
+    if (!content) return;
+
+    // Measure the content, not the viewport, so empty and populated lists both fit.
+    const observer = new ResizeObserver(() => {
+      const { width, height } = content.getBoundingClientRect();
+      getCurrentWindow()
+        .setSize(new LogicalSize(Math.ceil(width), Math.ceil(height)))
+        .catch((err) => console.error("Failed to resize popover:", err));
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, []);
 
   const metricsAvailable = metrics && !stale;
   const transitioning = status.state === "starting" || status.state === "stopping";
@@ -43,9 +65,16 @@ function Popover() {
     }
   };
 
-  const handleQuit = () => {
-    if (window.confirm("确定退出 macrdp？")) {
-      api.quitApp();
+  const handleQuit = async () => {
+    setQuitting(true);
+    setQuitError(null);
+    try {
+      await api.quitApp();
+    } catch (err) {
+      console.error("Failed to quit:", err);
+      setQuitError("退出失败，请重试");
+    } finally {
+      setQuitting(false);
     }
   };
 
@@ -61,7 +90,7 @@ function Popover() {
   const extraCount = connections.length - 3;
 
   return (
-    <div className="min-h-screen bg-[rgba(245,245,247,0.95)] backdrop-blur-xl rounded-xl overflow-hidden shadow-2xl">
+    <div ref={contentRef} className="bg-[rgba(245,245,247,0.95)] backdrop-blur-xl rounded-xl overflow-hidden shadow-2xl">
       <div className="flex flex-col p-3.5 gap-3">
         {/* Header row */}
         <div className="flex items-center justify-between">
@@ -87,14 +116,35 @@ function Popover() {
             >
               <Settings className="h-3.5 w-3.5" />
             </Button>
-            <Button
-              variant="destructive"
-              size="icon-xs"
-              onClick={handleQuit}
-              title="退出"
-            >
-              <LogOut className="h-3.5 w-3.5" />
-            </Button>
+            <AlertDialog.Root onOpenChange={() => setQuitError(null)}>
+              <AlertDialog.Trigger
+                render={<Button variant="destructive" size="icon-xs" title="退出" aria-label="退出" />}
+              >
+                <LogOut className="h-3.5 w-3.5" />
+              </AlertDialog.Trigger>
+              <AlertDialog.Portal>
+                <AlertDialog.Backdrop className="fixed inset-0 z-50 bg-black/25" />
+                <AlertDialog.Popup className="fixed left-1/2 top-1/2 z-50 w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-card p-4 shadow-lg">
+                  <AlertDialog.Title className="text-sm font-semibold">
+                    确定退出 macrdp？
+                  </AlertDialog.Title>
+                  <AlertDialog.Description className="mt-2 text-xs text-muted-foreground">
+                    退出将停止服务并断开当前连接。
+                  </AlertDialog.Description>
+                  {quitError && (
+                    <p role="alert" className="mt-2 text-xs text-destructive">{quitError}</p>
+                  )}
+                  <div className="mt-4 flex justify-end gap-2">
+                    <AlertDialog.Close render={<Button variant="outline" size="sm" disabled={quitting} />}>
+                      取消
+                    </AlertDialog.Close>
+                    <Button variant="destructive" size="sm" disabled={quitting} onClick={handleQuit}>
+                      {quitting ? "正在退出…" : "退出"}
+                    </Button>
+                  </div>
+                </AlertDialog.Popup>
+              </AlertDialog.Portal>
+            </AlertDialog.Root>
           </div>
         </div>
 
