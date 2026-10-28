@@ -214,7 +214,7 @@ pub fn create_encoder(cfg: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
     // Auto / Hardware: VideoToolbox GPU encoder. The session takes the *visible* (even) size —
     // VT does macroblock alignment and SPS cropping itself. A 16-aligned session instead makes VT
     // *scale* every zero-copy capture buffer up to it (1080→1088 measured by
-    // `vt_zero_copy_1080_pixel_buffer_decodes_to_visible_size`), which the client then crops.
+    // `vt_zero_copy_pixel_buffer_decodes_to_visible_size`), which the client then crops.
     // AVC444 keeps align16: the YUV444 split fills planes sized to the encoder.
     #[cfg(target_os = "macos")]
     if preference != EncoderPreference::Software {

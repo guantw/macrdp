@@ -230,7 +230,7 @@ extern "C" fn encode_callback(
         if status != 0 {
             warn_limited!(status, "VT encode callback error");
         } else {
-            warn_limited!("VT dropped frame (encoder over budget: QP cap vs data-rate limit, or session overloaded)");
+            warn_limited!("VT returned no encoded sample");
         }
         signal_empty();
         return;
@@ -593,16 +593,20 @@ impl VtEncoder {
     ) -> Result<(VTCompressionSessionRef, &'static str)> {
         let mut session: VTCompressionSessionRef = std::ptr::null_mut();
         let profile;
+        // Low-latency rate control caps AutoLevel at H.264 5.2. Above its frame
+        // size or macroblock rate it accepts the session but returns empty frames.
+        // The regular hardware encoder selects Level 6+ for those sizes while
+        // retaining our realtime/no-reordering configuration.
+        let macroblocks = width.div_ceil(16) * height.div_ceil(16);
+        let low_latency = macroblocks <= 36_864
+            && f64::from(macroblocks) * f64::from(fps) <= 2_073_600.0;
 
         unsafe {
-            // Hardware acceleration + low-latency rate control (EnableLowLatencyRateControl).
-            // Low-latency RC adapts QP per frame and treats AverageBitRate as its target;
-            // DataRateLimits below caps bursts so a keyframe cannot blow the LAN budget.
             let spec_keys = [
                 kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
                 kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
             ];
-            let spec_values = [kCFBooleanTrue, kCFBooleanTrue];
+            let spec_values = [kCFBooleanTrue, if low_latency { kCFBooleanTrue } else { kCFBooleanFalse }];
             let encoder_spec = CFDictionaryCreate(
                 std::ptr::null(), spec_keys.as_ptr(), spec_values.as_ptr(),
                 2, std::ptr::null(), std::ptr::null(),
@@ -706,7 +710,7 @@ impl VtEncoder {
             if let Err(e) = Self::apply_bitrate(session, bitrate) {
                 tracing::warn!("{e}");
             }
-            tracing::info!(bitrate_mbps = bitrate as f64 / 1_000_000.0, fps, profile, "VT session configured");
+            tracing::info!(bitrate_mbps = bitrate as f64 / 1_000_000.0, fps, profile, low_latency, "VT session configured");
             // IDR every 10 seconds — P-frame chains keep bandwidth flat for static desktops
             Self::set_num(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, cf_i32(fps as i32 * 10));
             // QP ceiling: low-latency RC otherwise lets static desktop text drift blurry (macOS 12+).
@@ -1454,59 +1458,78 @@ mod tests {
         assert!(!enc.encode_bgra(&bgra, 640, 360, 640 * 4).unwrap().data.is_empty());
     }
 
-    /// E2: ScreenCaptureKit delivers 1920×1080 NV12 buffers (not 16-aligned in height). The
-    /// zero-copy path must accept them and the stream must decode to exactly the visible size —
-    /// no padding rows, no VT rejection. Skips (prints why) when no hardware encoder exists.
+    /// Capture sizes must produce an IDR, including unaligned 1080p, ordinary 4K,
+    /// and sizes/rates above Level 5.2 that previously returned empty frames.
+    /// Decode within the test decoder's supported levels to check for unwanted scaling.
+    /// Skips (prints why) when no hardware encoder exists.
     #[test]
-    fn vt_zero_copy_1080_pixel_buffer_decodes_to_visible_size() {
+    fn vt_zero_copy_pixel_buffer_decodes_to_visible_size() {
         use openh264::formats::YUVSource;
-        let (w, h) = (1920u32, 1080u32);
-        let mut enc = match crate::create_encoder(crate::EncoderConfig {
-            width: w, height: h, fps: 30.0, quality: crate::Quality::Balanced,
-            pref: crate::EncoderPreference::Hardware, mode_444: false, bitrate: 8_000_000, max_qp: crate::DEFAULT_MAX_QP,
-        }) {
-            Ok(e) if e.supports_pixel_buffer() => e,
-            _ => { println!("skip: no VideoToolbox hardware encoder available"); return; }
-        };
+        for (w, h, fps, bitrate) in [
+            (1920u32, 1080u32, 30.0, 8_000_000),
+            (3840, 2160, 60.0, 32_000_000),
+            (3840, 2560, 60.0, 32_000_000),
+            (4096, 2304, 60.0, 32_000_000),
+            (5120, 2880, 60.0, 32_000_000),
+        ] {
+            let mut enc = match crate::create_encoder(crate::EncoderConfig {
+                width: w, height: h, fps, quality: crate::Quality::Balanced,
+                pref: crate::EncoderPreference::Hardware, mode_444: false, bitrate, max_qp: crate::DEFAULT_MAX_QP,
+            }) {
+                Ok(e) if e.supports_pixel_buffer() => e,
+                _ => { println!("skip: no VideoToolbox hardware encoder available"); return; }
+            };
 
-        // NV12 buffer at the capture size, top half white / bottom half black.
-        let pb = unsafe {
-            let mut pb: CVPixelBufferRef = std::ptr::null_mut();
-            let st = CVPixelBufferCreate(std::ptr::null(), w as usize, h as usize, K_CV_PIXEL_FORMAT_NV12, std::ptr::null(), &mut pb);
-            assert_eq!(st, 0, "CVPixelBufferCreate failed");
-            CVPixelBufferLockBaseAddress(pb, 0);
-            let y = CVPixelBufferGetBaseAddressOfPlane(pb, 0) as *mut u8;
-            let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
-            let uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1) as *mut u8;
-            let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
-            for row in 0..h as usize {
-                std::ptr::write_bytes(y.add(row * y_bpr), if row < h as usize / 2 { 235 } else { 16 }, w as usize);
+            // NV12 buffer at the capture size, top half white / bottom half black.
+            let pb = unsafe {
+                let mut pb: CVPixelBufferRef = std::ptr::null_mut();
+                let st = CVPixelBufferCreate(std::ptr::null(), w as usize, h as usize, K_CV_PIXEL_FORMAT_NV12, std::ptr::null(), &mut pb);
+                assert_eq!(st, 0, "CVPixelBufferCreate failed");
+                CVPixelBufferLockBaseAddress(pb, 0);
+                let y = CVPixelBufferGetBaseAddressOfPlane(pb, 0) as *mut u8;
+                let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+                let uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1) as *mut u8;
+                let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+                for row in 0..h as usize {
+                    std::ptr::write_bytes(y.add(row * y_bpr), if row < h as usize / 2 { 235 } else { 16 }, w as usize);
+                }
+                for row in 0..h as usize / 2 {
+                    std::ptr::write_bytes(uv.add(row * uv_bpr), 128, w as usize);
+                }
+                CVPixelBufferUnlockBaseAddress(pb, 0);
+                pb
+            };
+
+            let encoded = enc.encode_pixel_buffer(pb as *mut c_void, true).expect("encode_pixel_buffer");
+            unsafe { CVPixelBufferRelease(pb); }
+            assert!(encoded.is_keyframe && !encoded.data.is_empty(), "first zero-copy frame must be a non-empty IDR");
+            assert_eq!((encoded.width, encoded.height), (w, h), "encoded dimensions must preserve the capture size");
+            let sps = encoded.data.windows(5)
+                .position(|nal| nal[..4] == [0, 0, 0, 1] && nal[4] & 0x1F == 7)
+                .expect("SPS on IDR");
+            let level = encoded.data[sps + 7];
+            println!("encoded {w}x{h}@{fps}: {} bytes, H.264 level {level}", encoded.data.len());
+            // OpenH264's decoder rejects SPS levels above 5.2 before decoding.
+            // Such streams require a decoder that supports Level 6 or later.
+            if level > 52 {
+                continue;
             }
-            for row in 0..h as usize / 2 {
-                std::ptr::write_bytes(uv.add(row * uv_bpr), 128, w as usize);
-            }
-            CVPixelBufferUnlockBaseAddress(pb, 0);
-            pb
-        };
 
-        let encoded = enc.encode_pixel_buffer(pb as *mut c_void, true).expect("encode_pixel_buffer");
-        unsafe { CVPixelBufferRelease(pb); }
-        assert!(encoded.is_keyframe && !encoded.data.is_empty(), "first zero-copy frame must be a non-empty IDR");
+            let mut dec = openh264::decoder::Decoder::new().expect("OpenH264 decoder");
+            let pic = dec.decode(&encoded.data).expect("decode").expect("IDR must yield a picture");
+            let (dw, dh) = pic.dimensions();
+            let (ys, _, _) = pic.strides();
+            let y = pic.y();
+            let first_dark = (0..dh).find(|&r| y[r * ys + 100] < 128);
+            println!("input {w}x{h}@{fps} NV12 -> encoded.{{width,height}}={}x{}, decoded {dw}x{dh}, {} bytes, white/black edge at row {first_dark:?} (source: {})",
+                     encoded.width, encoded.height, encoded.data.len(), h / 2);
+            assert_eq!((dw as u32, dh as u32), (w, h), "decoded size must equal the visible capture size");
+            assert_eq!((encoded.width, encoded.height), (w, h), "encoded.width/height must report the visible size");
 
-        let mut dec = openh264::decoder::Decoder::new().expect("OpenH264 decoder");
-        let pic = dec.decode(&encoded.data).expect("decode").expect("IDR must yield a picture");
-        let (dw, dh) = pic.dimensions();
-        let (ys, _, _) = pic.strides();
-        let y = pic.y();
-        let first_dark = (0..dh).find(|&r| y[r * ys + 100] < 128);
-        println!("E2: input {w}x{h} NV12 -> encoded.{{width,height}}={}x{}, decoded {dw}x{dh}, {} bytes, white/black edge at row {first_dark:?} (source: {})",
-                 encoded.width, encoded.height, encoded.data.len(), h / 2);
-        assert_eq!((dw as u32, dh as u32), (w, h), "decoded size must equal the visible capture size");
-        assert_eq!((encoded.width, encoded.height), (w, h), "encoded.width/height must report the visible size");
-
-        // Pattern survives unscaled: edge where the source put it, bottom rows (incl. the last 8) dark.
-        assert_eq!(first_dark, Some(h as usize / 2), "white/black edge moved: VT scaled the frame");
-        assert!(y[10 * ys + 100] > 200, "top must be white, got {}", y[10 * ys + 100]);
-        assert!(y[(dh - 4) * ys + 100] < 60, "bottom must be black, got {}", y[(dh - 4) * ys + 100]);
+            // Pattern survives unscaled: edge where the source put it, bottom rows (incl. the last 8) dark.
+            assert_eq!(first_dark, Some(h as usize / 2), "white/black edge moved: VT scaled the frame");
+            assert!(y[10 * ys + 100] > 200, "top must be white, got {}", y[10 * ys + 100]);
+            assert!(y[(dh - 4) * ys + 100] < 60, "bottom must be black, got {}", y[(dh - 4) * ys + 100]);
+        }
     }
 }
