@@ -229,6 +229,7 @@ impl RdpServerDisplay for MacDisplay {
 
         Ok(Box::new(MacDisplayUpdates {
             capturer,
+            coord_mapper: self.coord_mapper.clone(),
             _display_power: display_power,
             cursor,
             capture_config,
@@ -330,6 +331,7 @@ const SCK_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 struct MacDisplayUpdates {
     capturer: ScreenCapturer,
+    coord_mapper: MouseCoordMapper,
     _display_power: Option<DisplayPower>,
     /// Client-side cursor: pointer PDU on shape change (None = cursor is in the video frame).
     cursor: Option<CursorWatcher>,
@@ -602,6 +604,9 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 }
                 frame = newer;
             }
+            self.coord_mapper.update_capture_geometry(
+                self.capturer.content_rect(), self.capturer.logical_size(),
+            );
             if let Some(update) = self.encode_and_send(frame).await? {
                 return Ok(Some(update));
             }
@@ -749,6 +754,12 @@ impl MacDisplayUpdates {
             // Throttle to the configured fps on both the success and the failure path.
             tokio::time::sleep(fallback.frame_interval()).await;
             if let Some(cg_frame) = fallback.capture_frame() {
+                // CoreGraphics stretches into the full frame instead of letterboxing.
+                self.coord_mapper.update_capture_geometry(
+                    None,
+                    macrdp_capture::detect_cg_display_size().ok()
+                        .map(|(w, h)| (w as f64, h as f64)),
+                );
                 return self.encode_and_send(cg_frame).await;
             }
         }

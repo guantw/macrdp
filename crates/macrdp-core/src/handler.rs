@@ -4,11 +4,8 @@ use std::sync::{Arc, Mutex};
 
 /// Maps RDP desktop coordinates to macOS logical coordinates.
 ///
-/// Completely independent of capture/encode resolution — only cares about
-/// the RDP desktop size (what the client thinks) and the macOS CG logical
-/// display size (what CGEvent expects).
-///
-/// Formula: `mac = rdp × cg_logical ÷ rdp_desktop`
+/// Uses the captured content bounds inside the RDP desktop, excluding any bars.
+/// Formula: `mac = (rdp - content_origin) × cg_logical ÷ content_size`.
 #[derive(Debug, Clone)]
 pub struct MouseCoordMapper(Arc<Mutex<CoordState>>);
 
@@ -18,6 +15,7 @@ struct CoordState {
     logical_h: f64,
     rdp_w: f64,
     rdp_h: f64,
+    content_rect: Option<(f64, f64, f64, f64)>,
 }
 
 impl MouseCoordMapper {
@@ -31,13 +29,17 @@ impl MouseCoordMapper {
             logical_h: logical_h as f64,
             rdp_w: rdp_w.max(1) as f64,
             rdp_h: rdp_h.max(1) as f64,
+            content_rect: None,
         })))
     }
 
     pub fn map(&self, rdp_x: u16, rdp_y: u16) -> (u16, u16) {
         let s = self.0.lock().unwrap();
-        let mac_x = (rdp_x as f64 * s.logical_w / s.rdp_w) as u16;
-        let mac_y = (rdp_y as f64 * s.logical_h / s.rdp_h) as u16;
+        let (x, y, w, h) = s.content_rect.unwrap_or((0.0, 0.0, s.rdp_w, s.rdp_h));
+        let mac_x = ((rdp_x as f64 - x) * s.logical_w / w)
+            .clamp(0.0, (s.logical_w - 1.0).max(0.0)) as u16;
+        let mac_y = ((rdp_y as f64 - y) * s.logical_h / h)
+            .clamp(0.0, (s.logical_h - 1.0).max(0.0)) as u16;
         (mac_x, mac_y)
     }
 
@@ -52,12 +54,32 @@ impl MouseCoordMapper {
         (s.logical_w as u16, s.logical_h as u16)
     }
 
+    /// Both coordinate spaces come from the same frame and are checked at capture.
+    pub fn update_capture_geometry(
+        &self,
+        content_rect: Option<(f64, f64, f64, f64)>,
+        logical_size: Option<(f64, f64)>,
+    ) {
+        let mut s = self.0.lock().unwrap();
+        let (logical_w, logical_h) = logical_size.unwrap_or((s.logical_w, s.logical_h));
+        if s.content_rect != content_rect || s.logical_w != logical_w || s.logical_h != logical_h {
+            s.logical_w = logical_w;
+            s.logical_h = logical_h;
+            s.content_rect = content_rect;
+            tracing::debug!(
+                "Mouse mapping updated: logical={}x{}, rdp={}x{}, content_pixels={content_rect:?}",
+                s.logical_w, s.logical_h, s.rdp_w, s.rdp_h,
+            );
+        }
+    }
+
     pub fn update_rdp_size(&self, rdp_w: u16, rdp_h: u16) {
         let mut s = self.0.lock().unwrap();
         let old_w = s.rdp_w;
         let old_h = s.rdp_h;
         s.rdp_w = rdp_w.max(1) as f64;
         s.rdp_h = rdp_h.max(1) as f64;
+        s.content_rect = None;
         tracing::info!(
             new_rdp_w = rdp_w, new_rdp_h = rdp_h,
             old_rdp_w = old_w, old_rdp_h = old_h,
@@ -163,5 +185,72 @@ impl RdpServerInputHandler for MacInputHandler {
         if let Err(e) = result {
             tracing::warn!("Mouse injection failed: {e}");
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mouse_mapping_excludes_bars_and_clamps_to_the_visible_desktop() {
+        let mapper = MouseCoordMapper::new(1920, 1080, 1920, 1440);
+        // A 16:9 desktop inside a 4:3 RDP frame has 180-pixel top/bottom bars.
+        mapper.update_capture_geometry(Some((0.0, 180.0, 1920.0, 1080.0)), None);
+        assert_eq!(mapper.map(320, 180), (320, 0));
+        assert_eq!(mapper.map(960, 720), (960, 540));
+        assert_eq!(mapper.map(1919, 1259), (1919, 1079));
+        assert_eq!(mapper.map(320, 60), (320, 0));
+        assert_eq!(mapper.map(320, 1380), (320, 1079));
+
+        // Use the frame's actual origin and size, including non-centered placement.
+        mapper.update_rdp_size(1600, 900);
+        mapper.update_capture_geometry(Some((100.0, 80.0, 1280.0, 720.0)), None);
+        assert_eq!(mapper.map(100, 80), (0, 0));
+        assert_eq!(mapper.map(740, 440), (960, 540));
+        assert_eq!(mapper.map(0, 440), (0, 540));
+        assert_eq!(mapper.map(1599, 440), (1919, 540));
+
+        // The capture boundary converts Retina surface points to output pixels.
+        mapper.update_rdp_size(3840, 2160);
+        mapper.update_capture_geometry(Some((0.0, 0.0, 3840.0, 2160.0)), None);
+        assert_eq!(mapper.map(0, 0), (0, 0));
+        assert_eq!(mapper.map(960, 540), (480, 270));
+        assert_eq!(mapper.map(1920, 1080), (960, 540));
+        assert_eq!(mapper.map(3839, 2159), (1919, 1079));
+
+        mapper.update_rdp_size(3840, 2880);
+        mapper.update_capture_geometry(Some((0.0, 360.0, 3840.0, 2160.0)), None);
+        assert_eq!(mapper.map(1920, 360), (960, 0));
+        assert_eq!(mapper.map(1920, 1440), (960, 540));
+        assert_eq!(mapper.map(1920, 2519), (960, 1079));
+
+        // A live display mode change must update the source height as well as bars.
+        // These are the observed SCK geometries at a fixed 3840x2160 output size.
+        mapper.update_rdp_size(3840, 2160);
+        mapper.update_capture_geometry(
+            Some((300.0, 0.0, 3240.0, 2160.0)), Some((1920.0, 1280.0)),
+        );
+        assert_eq!(mapper.map(1920, 1080), (960, 640));
+        assert_eq!(mapper.map(1920, 2159), (960, 1279));
+        mapper.update_capture_geometry(
+            Some((0.0, 0.0, 3840.0, 2160.0)), Some((1920.0, 1080.0)),
+        );
+        for (rdp_y, mac_y) in [(0, 0), (540, 270), (1080, 540), (1620, 810), (1822, 911), (2159, 1079)] {
+            assert_eq!(mapper.map(1920, rdp_y), (960, mac_y));
+        }
+    }
+
+    #[test]
+    fn mouse_mapping_restores_full_frame_for_fallback_and_resize() {
+        let mapper = MouseCoordMapper::new(1920, 1080, 3840, 2160);
+        assert_eq!(mapper.map(1920, 1080), (960, 540));
+        assert_eq!(mapper.map(3839, 2159), (1919, 1079));
+        mapper.update_capture_geometry(Some((0.0, 180.0, 1920.0, 1080.0)), None);
+        mapper.update_capture_geometry(None, Some((1920.0, 1080.0))); // CoreGraphics
+        assert_eq!(mapper.map(1920, 1080), (960, 540));
+
+        mapper.update_capture_geometry(Some((0.0, 180.0, 1920.0, 1080.0)), None);
+        mapper.update_rdp_size(2560, 1440);
+        assert_eq!(mapper.map(1280, 720), (960, 540));
     }
 }

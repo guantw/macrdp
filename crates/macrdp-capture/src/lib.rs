@@ -133,7 +133,9 @@ pub struct CaptureConfig {
 /// Screen capturer using ScreenCaptureKit
 pub struct ScreenCapturer {
     stream: Arc<SCStream>,
-    slot: Arc<LatestSlot<CaptureEvent>>,
+    slot: Arc<LatestSlot<CaptureOutput>>,
+    content_rect: Option<(f64, f64, f64, f64)>,
+    logical_size: Option<(f64, f64)>,
     /// The full stream configuration: SCK's updateConfiguration replaces the whole object,
     /// so a frame-rate change must resend size/pixel format/cursor/queue depth too.
     config: SCStreamConfiguration,
@@ -344,15 +346,34 @@ pub fn compact_dirty_rects(rects: &mut Vec<Rect>) {
     }
 }
 
+struct CaptureOutput {
+    event: CaptureEvent,
+    content_rect: Option<(f64, f64, f64, f64)>,
+    logical_size: Option<(f64, f64)>,
+}
+
+/// SCK contentRect is in surface points; RDP input uses output pixels.
+/// contentScale is already reflected in the rectangle's size and position.
+fn content_rect_in_pixels(
+    rect: Option<screencapturekit::cg::CGRect>,
+    scale_factor: Option<f64>,
+) -> Option<(f64, f64, f64, f64)> {
+    let rect = rect?;
+    let scale = scale_factor.filter(|scale| scale.is_finite() && *scale > 0.0)?;
+    let (x, y, w, h) = (rect.x * scale, rect.y * scale, rect.width * scale, rect.height * scale);
+    (x.is_finite() && y.is_finite() && w.is_finite() && w > 0.0 && h.is_finite() && h > 0.0)
+        .then_some((x, y, w, h))
+}
+
 struct VideoOutputHandler {
-    slot: Arc<LatestSlot<CaptureEvent>>,
+    slot: Arc<LatestSlot<CaptureOutput>>,
     pixel_format: CapturePixelFormat,
     /// Unread frames replaced by a newer one (consumer slower than capture).
     dropped: std::sync::atomic::AtomicU64,
 }
 
 struct CaptureDelegate {
-    slot: Arc<LatestSlot<CaptureEvent>>,
+    slot: Arc<LatestSlot<CaptureOutput>>,
 }
 
 impl SCStreamDelegateTrait for CaptureDelegate {
@@ -386,14 +407,25 @@ impl SCStreamOutputTrait for VideoOutputHandler {
             CapturePixelFormat::Bgra => extract_frame(&sample),
         };
         let Some(event) = event else { return };
+        // Convert the metadata once at the capture boundary, including bar offsets.
+        let content_rect = content_rect_in_pixels(sample.content_rect(), sample.scale_factor());
+        // Keep the source dimensions from this same frame: display mode changes can
+        // alter the logical desktop while the configured output size stays fixed.
+        let logical_size = sample.screen_rect()
+            .filter(|rect| {
+                rect.width.is_finite() && rect.width > 0.0
+                    && rect.height.is_finite() && rect.height > 0.0
+            })
+            .map(|rect| (rect.width, rect.height));
+        let output = CaptureOutput { event, content_rect, logical_size };
 
         // Never blocks the SCK callback: a Frame replaces an unread Frame (latest wins), an
         // Idle only fills an empty slot so it cannot hide an unread Frame. The replaced
         // Frame's dirty rects are folded into the new one so the consumer still refreshes
         // the regions that only changed in the frame it never saw.
-        let replaced = match event {
-            CaptureEvent::Frame(_) => self.slot.put_with(event, |old, new| {
-                if let (CaptureEvent::Frame(old), CaptureEvent::Frame(new)) = (old, new) {
+        let replaced = match &output.event {
+            CaptureEvent::Frame(_) => self.slot.put_with(output, |old, new| {
+                if let (CaptureEvent::Frame(old), CaptureEvent::Frame(new)) = (&old.event, &mut new.event) {
                     // Empty = whole frame; stays empty if either side was
                     if old.dirty_rects.is_empty() || new.dirty_rects.is_empty() {
                         new.dirty_rects.clear();
@@ -404,7 +436,7 @@ impl SCStreamOutputTrait for VideoOutputHandler {
                 }
             }),
             CaptureEvent::Idle => {
-                self.slot.put_if_empty(event);
+                self.slot.put_if_empty(output);
                 false
             }
         };
@@ -802,17 +834,41 @@ impl ScreenCapturer {
             "Screen capture started"
         );
 
-        Ok(Self { stream, slot, config: stream_config, busy })
+        Ok(Self {
+            stream, slot, content_rect: None, logical_size: None,
+            config: stream_config, busy,
+        })
     }
 
     /// Receive the next capture event (async, cancellation safe)
     pub async fn next_frame(&mut self) -> Option<CaptureEvent> {
-        self.slot.take().await
+        let output = self.slot.take().await?;
+        if matches!(output.event, CaptureEvent::Frame(_)) {
+            self.content_rect = output.content_rect;
+            self.logical_size = output.logical_size;
+        }
+        Some(output.event)
     }
 
     /// Try to get a buffered capture event without waiting. Returns None if no event ready.
     pub fn try_next_frame(&mut self) -> Option<CaptureEvent> {
-        self.slot.try_take()
+        let output = self.slot.try_take()?;
+        if matches!(output.event, CaptureEvent::Frame(_)) {
+            self.content_rect = output.content_rect;
+            self.logical_size = output.logical_size;
+        }
+        Some(output.event)
+    }
+
+    /// Content bounds in output pixels for the most recently received frame.
+    /// None means no rectangle metadata is available; use the complete frame.
+    pub fn content_rect(&self) -> Option<(f64, f64, f64, f64)> {
+        self.content_rect
+    }
+
+    /// Source desktop size in logical points for the most recently received frame.
+    pub fn logical_size(&self) -> Option<(f64, f64)> {
+        self.logical_size
     }
 
     /// Close the frame slot: `next_frame` returns `None` from now on, so the caller falls
@@ -990,6 +1046,29 @@ mod tests {
     use core_graphics::color_space::CGColorSpace;
     use core_graphics::context::CGContext;
     use core_graphics::image::CGImage;
+
+    #[test]
+    fn content_bounds_convert_surface_points_to_pixels_including_bars() {
+        use screencapturekit::cg::CGRect;
+
+        for (rect, scale, expected) in [
+            ((0.0, 0.0, 1920.0, 1080.0), 1.0, (0.0, 0.0, 1920.0, 1080.0)),
+            ((0.0, 0.0, 1920.0, 1080.0), 2.0, (0.0, 0.0, 3840.0, 2160.0)),
+            ((0.0, 180.0, 1920.0, 1080.0), 2.0, (0.0, 360.0, 3840.0, 2160.0)),
+            // Content has already been scaled down to fit the output surface.
+            ((50.0, 40.0, 640.0, 360.0), 2.0, (100.0, 80.0, 1280.0, 720.0)),
+        ] {
+            assert_eq!(content_rect_in_pixels(
+                Some(CGRect::new(rect.0, rect.1, rect.2, rect.3)), Some(scale)
+            ), Some(expected));
+        }
+        let rect = Some(CGRect::new(0.0, 0.0, 1920.0, 1080.0));
+        assert_eq!(content_rect_in_pixels(None, Some(2.0)), None);
+        assert_eq!(content_rect_in_pixels(rect, None), None);
+        assert_eq!(content_rect_in_pixels(rect, Some(0.0)), None);
+        assert_eq!(content_rect_in_pixels(rect, Some(f64::NAN)), None);
+    }
+
     /// SCStream copies its configuration before capture starts. The color properties
     /// borrow CFString pointers, so their owners must survive the setter calls.
     /// This exercises that native copy without enumerating displays or capturing pixels.
