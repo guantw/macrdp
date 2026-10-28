@@ -28,7 +28,9 @@ const UNCOMPRESSED_MAX_PIXELS: u32 = 65536;
 pub struct MacDisplay {
     width: u16,
     height: u16,
-    /// Maximum resolution (auto-detected or configured). Client cannot exceed this.
+    /// Main display backing pixels, when available, used by Auto.
+    native_size: Option<(u16, u16)>,
+    /// Client resize limits retain the existing fallback when display queries fail.
     max_width: u16,
     max_height: u16,
     /// Whether resolution is fixed by config (true) or follows client (false)
@@ -74,15 +76,15 @@ impl MacDisplay {
         let base_bitrate = bitrate_override
             .unwrap_or_else(|| macrdp_encode::screen_bitrate(width as u32, height as u32, frame_rate as f32, quality));
         tracing::info!(base_bitrate_mbps = base_bitrate as f64 / 1_000_000.0, "Base bitrate");
-        // Upper bound = physical pixels (CG logical points × backing scale). `width`/`height`
-        // may already be scaled in auto mode, so never derive the bound from them.
-        let (max_w, max_h) = macrdp_capture::detect_cg_display_size().ok()
-            .zip(macrdp_capture::detect_display_scale().ok())
-            .map(|((cg_w, cg_h), scale)| (width.max((cg_w * scale).min(u16::MAX as u32) as u16), height.max((cg_h * scale).min(u16::MAX as u32) as u16)))
+        let native_size = macrdp_capture::detect_display_pixel_size()
+            .map(|(w, h)| (w.min(u16::MAX as u32) as u16, h.min(u16::MAX as u32) as u16))
+            .ok();
+        let (max_width, max_height) = native_size
+            .map(|(w, h)| (width.max(w), height.max(h)))
             .unwrap_or((width.max(3840), height.max(2160)));
         Self {
             width, height,
-            max_width: max_w, max_height: max_h,
+            native_size, max_width, max_height,
             fixed_resolution,
             frame_rate, quality, encoder_pref, mode_444, show_cursor, cursor_pdu, bitrate_override, base_bitrate, gfx_state,
             coord_mapper,
@@ -102,8 +104,7 @@ impl MacDisplay {
     }
 
     fn apply_resize(&mut self, width: u16, height: u16, source: &str) {
-        let w = width.min(self.max_width);
-        let h = height.min(self.max_height);
+        let (w, h) = (width, height);
         if w > 0 && h > 0 && (w != self.width || h != self.height) {
             tracing::info!(
                 old_w = self.width, old_h = self.height,
@@ -130,12 +131,21 @@ impl RdpServerDisplay for MacDisplay {
             tracing::debug!("Ignoring resize request — resolution is fixed by config");
             return;
         }
-        self.apply_resize(width, height, "client-requested");
+        self.apply_resize(width.min(self.max_width), height.min(self.max_height), "client-requested");
     }
 
     fn set_size(&mut self, width: u16, height: u16) {
         self.apply_resize(width, height, "server-config");
         self.fixed_resolution = true;
+    }
+
+    fn set_resolution(&mut self, resolution: &str) {
+        let logical_size = self.coord_mapper.logical_size();
+        let (width, height) = crate::server::resolve_resolution_with_pixels(
+            resolution, logical_size, self.native_size.unwrap_or(logical_size),
+        );
+        self.apply_resize(width, height, "server-config");
+        self.fixed_resolution = resolution != "auto";
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
@@ -1422,6 +1432,61 @@ impl MacDisplayUpdates {
 #[cfg(test)]
 mod tests {
     use super::{CACHE_FLUSH_RETRY, IDLE_IDR_INTERVAL, flush_backoff, max_pending_acks};
+
+    #[tokio::test]
+    async fn resolution_changes_apply_exact_size_and_restore_auto_for_reconnect() {
+        use super::*;
+
+        // Construct from known display metadata: no capture, encoder or OS queries.
+        let mapper = MouseCoordMapper::new(1920, 1080, 3840, 2160);
+        let mut display = MacDisplay {
+            width: 3840, height: 2160,
+            native_size: Some((3840, 2160)),
+            max_width: 3840, max_height: 2160,
+            fixed_resolution: false,
+            frame_rate: 30,
+            quality: Quality::Balanced,
+            encoder_pref: macrdp_encode::EncoderPreference::Software,
+            mode_444: false,
+            show_cursor: false,
+            cursor_pdu: false,
+            bitrate_override: None,
+            base_bitrate: 0,
+            gfx_state: Arc::new(Mutex::new(GfxState::new(3840, 2160, false))),
+            coord_mapper: mapper.clone(),
+            shared_audio_tx: None,
+            perf_stats: None,
+            hot_fps: Arc::new(AtomicU32::new(30)),
+        };
+        display.set_resolution("5120x2880");
+        assert_eq!(display.size().await, DesktopSize { width: 5120, height: 2880 });
+        assert_eq!(mapper.map(2560, 1440), (960, 540));
+        display.request_resize(1920, 1080);
+        assert_eq!(display.size().await, DesktopSize { width: 5120, height: 2880 });
+
+        display.set_resolution("1920x1080");
+        assert_eq!(display.size().await, DesktopSize { width: 1920, height: 1080 });
+        display.set_resolution("auto");
+        assert_eq!(display.size().await, DesktopSize { width: 3840, height: 2160 });
+        assert_eq!(mapper.map(1920, 1080), (960, 540));
+        // Preserve Auto's existing client resize behavior and native upper bound.
+        display.request_resize(2560, 1440);
+        assert_eq!(display.size().await, DesktopSize { width: 2560, height: 1440 });
+        display.request_resize(7680, 4320);
+        assert_eq!(display.size().await, DesktopSize { width: 3840, height: 2160 });
+
+        display.set_size(2560, 1440);
+        display.request_resize(1920, 1080);
+        assert_eq!(display.size().await, DesktopSize { width: 2560, height: 1440 });
+
+        // A failed pixel query must not lower the existing resize limit or turn
+        // that limit into Auto's detected resolution.
+        display.native_size = None;
+        display.set_resolution("auto");
+        assert_eq!(display.size().await, DesktopSize { width: 1920, height: 1080 });
+        display.request_resize(7680, 4320);
+        assert_eq!(display.size().await, DesktopSize { width: 3840, height: 2160 });
+    }
 
     #[test]
     fn flush_backoff_doubles_and_caps() {

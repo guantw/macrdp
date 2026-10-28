@@ -366,19 +366,16 @@ impl RdpServer {
 
         // Apply hot-updated resolution for this new connection
         if let Some(ref res) = pending_resolution {
-            if let Some((w, h)) = res.split_once('x').and_then(|(w, h)| {
-                Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?))
-            }) {
-                info!(w, h, "Applying hot-updated resolution for new connection");
-                // Use set_size (bypasses fixed_resolution check, since this is server-initiated)
-                self.display.lock().await.set_size(w, h);
-                let mut gs = self.gfx_state.lock().unwrap();
-                gs.width = w;
-                gs.height = h;
-            }
+            info!(%res, "Applying hot-updated resolution for new connection");
+            self.display.lock().await.set_resolution(res);
         }
 
         let size = self.display.lock().await.size().await;
+        {
+            let mut gs = self.gfx_state.lock().unwrap();
+            gs.width = size.width;
+            gs.height = size.height;
+        }
         let capabilities = capabilities::capabilities(&self.opts, size);
         let mut acceptor = Acceptor::new(self.opts.security.flag(), size, capabilities, self.creds.clone());
 

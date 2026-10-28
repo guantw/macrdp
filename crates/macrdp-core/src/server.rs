@@ -9,7 +9,7 @@ fn parse_resolution(s: &str) -> Option<(u32, u32)> {
 /// Resolve resolution config value to (width, height).
 ///
 /// Supports three formats:
-/// - "auto": detect display scale and multiply logical resolution
+/// - "auto": use the main display's backing pixel dimensions
 /// - "WxH" (e.g. "3840x2160"): use directly
 /// - legacy numeric scale (e.g. "2"): multiply logical resolution by scale factor
 pub fn resolve_resolution(
@@ -17,10 +17,25 @@ pub fn resolve_resolution(
     logical_w: u16,
     logical_h: u16,
 ) -> (u16, u16) {
+    let pixel_size = if res_mode == "auto" {
+        macrdp_capture::detect_display_pixel_size()
+            .map(|(w, h)| (w as u16, h as u16))
+            .unwrap_or((logical_w, logical_h))
+    } else {
+        (logical_w, logical_h)
+    };
+    resolve_resolution_with_pixels(res_mode, (logical_w, logical_h), pixel_size)
+}
+
+pub(crate) fn resolve_resolution_with_pixels(
+    res_mode: &str,
+    logical_size: (u16, u16),
+    pixel_size: (u16, u16),
+) -> (u16, u16) {
+    let (logical_w, logical_h) = logical_size;
     if res_mode == "auto" {
-        let scale = macrdp_capture::detect_display_scale().unwrap_or(1);
-        tracing::info!(scale, logical_w, logical_h, "Resolution auto: display scale");
-        (logical_w * scale as u16, logical_h * scale as u16)
+        tracing::info!(width = pixel_size.0, height = pixel_size.1, "Resolution auto: display pixels");
+        pixel_size
     } else if let Some((w, h)) = parse_resolution(res_mode) {
         tracing::info!(w, h, "Resolution: explicit WxH");
         (w as u16, h as u16)
@@ -318,7 +333,14 @@ async fn start_server_inner(
 
     // Resolution
     let res_mode = config.resolution.as_deref().unwrap_or("auto");
-    let (width, height) = resolve_resolution(res_mode, width, height);
+    let pixel_size = macrdp_capture::detect_display_pixel_size()
+        .map(|(w, h)| (w as u16, h as u16))
+        .unwrap_or((width, height));
+    let (width, height) = if config.width > 0 && config.height > 0 && res_mode == "auto" {
+        (width, height)
+    } else {
+        resolve_resolution_with_pixels(res_mode, (width, height), pixel_size)
+    };
 
     // Mouse coordinate mapping: mac = rdp × cg_logical ÷ rdp_desktop
     let coord_mapper = crate::handler::MouseCoordMapper::new(cg_w, cg_h, width, height);
@@ -650,6 +672,18 @@ fn run_server_thread(args: ServerThreadArgs) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolution_modes_distinguish_logical_points_from_backing_pixels() {
+        let logical = (1920, 1080);
+        let pixels = (3840, 2160);
+        assert_eq!(resolve_resolution_with_pixels("auto", logical, pixels), pixels);
+        assert_eq!(resolve_resolution("5120x2880", 1920, 1080), (5120, 2880));
+        assert_eq!(resolve_resolution("2", 1920, 1080), pixels);
+        assert_eq!(resolve_resolution("1", 1920, 1080), logical);
+        assert_eq!(resolve_resolution_with_pixels("auto", (2560, 1440), pixels), pixels);
+        assert_eq!(resolve_resolution_with_pixels("auto", logical, logical), logical);
+    }
 
     #[derive(Default)]
     struct StatusRecorder(Mutex<Vec<ServerStatus>>);

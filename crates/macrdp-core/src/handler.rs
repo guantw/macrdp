@@ -47,6 +47,11 @@ impl MouseCoordMapper {
         s.rdp_w / s.logical_w.max(1.0)
     }
 
+    pub fn logical_size(&self) -> (u16, u16) {
+        let s = self.0.lock().unwrap();
+        (s.logical_w as u16, s.logical_h as u16)
+    }
+
     pub fn update_rdp_size(&self, rdp_w: u16, rdp_h: u16) {
         let mut s = self.0.lock().unwrap();
         let old_w = s.rdp_w;

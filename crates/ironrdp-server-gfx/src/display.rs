@@ -351,8 +351,17 @@ pub trait RdpServerDisplay: Send {
 
     /// Force-set display size (server-initiated, bypasses fixed_resolution check).
     /// Used for hot-config resolution changes that apply on next connection.
-    fn set_size(&mut self, _width: u16, _height: u16) {
-        // Default: delegate to request_resize
+    fn set_size(&mut self, _width: u16, _height: u16) {}
+
+    /// Apply a server resolution mode before negotiating the next connection.
+    /// The display owns mode interpretation, including restoring Auto sizing.
+    /// Existing implementations that only override `set_size` retain WxH updates.
+    fn set_resolution(&mut self, resolution: &str) {
+        if let Some((width, height)) = resolution.split_once('x').and_then(|(w, h)| {
+            Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?))
+        }) {
+            self.set_size(width, height);
+        }
     }
 }
 
@@ -364,6 +373,31 @@ mod tests {
     use ironrdp_graphics::image_processing::PixelFormat;
 
     use super::{BitmapUpdate, Framebuffer};
+
+    #[tokio::test]
+    async fn resolution_updates_reach_legacy_set_size_implementations() {
+        use super::{RdpServerDisplay, RdpServerDisplayUpdates};
+        use crate::DesktopSize;
+
+        struct LegacyDisplay(DesktopSize);
+
+        #[async_trait::async_trait]
+        impl RdpServerDisplay for LegacyDisplay {
+            async fn size(&mut self) -> DesktopSize { self.0 }
+            async fn updates(&mut self) -> anyhow::Result<Box<dyn RdpServerDisplayUpdates>> {
+                unreachable!("this test does not start capture")
+            }
+            fn set_size(&mut self, width: u16, height: u16) {
+                self.0 = DesktopSize { width, height };
+            }
+        }
+
+        let mut display = LegacyDisplay(DesktopSize { width: 800, height: 600 });
+        display.set_resolution("1920x1080");
+        assert_eq!(display.size().await, DesktopSize { width: 1920, height: 1080 });
+        display.set_resolution("auto"); // Existing default has no display metadata.
+        assert_eq!(display.size().await, DesktopSize { width: 1920, height: 1080 });
+    }
 
     #[test]
     fn framebuffer_update() {

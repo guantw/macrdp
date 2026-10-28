@@ -44,6 +44,20 @@ impl RdpServerDisplay for TestDisplay {
         self.size
     }
 
+    fn set_resolution(&mut self, resolution: &str) {
+        self.size = match resolution {
+            "80x60" => DesktopSize {
+                width: 80,
+                height: 60,
+            },
+            "auto" => DesktopSize {
+                width: 64,
+                height: 48,
+            },
+            _ => panic!("unexpected test resolution: {resolution}"),
+        };
+    }
+
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
         self.observations
             .display_attempts
@@ -271,6 +285,10 @@ async fn authenticated_sessions_deliver_frames_and_input_and_survive_failed_reco
             },
         })
         .build();
+    let gfx_state = Arc::new(std::sync::Mutex::new(crate::gfx::GfxState::new(
+        64, 48, false,
+    )));
+    server.set_gfx_state(Arc::clone(&gfx_state));
     server.set_credentials(Some(Credentials {
         username: "viewer".into(),
         password: "test-password".into(),
@@ -317,9 +335,22 @@ async fn authenticated_sessions_deliver_frames_and_input_and_survive_failed_reco
             ),
             (true, "viewer", "test-password", Expected::Frame),
         ];
+        let mut successful_connections = 0;
         for (nla, username, password, expected) in cases {
             eprintln!("Starting protocol case: NLA={nla}, {expected:?}");
-            let expected_size = (64, 48);
+            let expected_size = if matches!(expected, Expected::Frame) {
+                successful_connections += 1;
+                let (mode, size) = match successful_connections {
+                    1 => (None, (64, 48)),
+                    2 => (Some("80x60"), (80, 60)),
+                    3 => (Some("auto"), (64, 48)),
+                    _ => unreachable!(),
+                };
+                gfx_state.lock().unwrap().resolution = mode.map(str::to_owned);
+                size
+            } else {
+                (64, 48)
+            };
             let attempts_before = observations.display_attempts.load(Ordering::SeqCst);
             observations.fail_next_display.store(
                 matches!(expected, Expected::DisplayRejected),

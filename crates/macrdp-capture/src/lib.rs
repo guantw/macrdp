@@ -628,16 +628,18 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
 
 /// Detect the main display's native scale factor (1 for non-Retina, 2 for Retina).
 pub fn detect_display_scale() -> Result<u32> {
-    use core_graphics::display::CGDisplay;
-    let main = CGDisplay::main();
-    let physical_w = main.pixels_wide() as u32;
-    let content = SCShareableContent::get()
-        .context("Failed to get shareable content")?;
-    let display = content.displays().into_iter().next()
-        .context("No display found")?;
-    let logical_w = display.width();
+    let (physical_w, _) = detect_display_pixel_size()?;
+    let (logical_w, _) = detect_cg_display_size()?;
     let scale = if logical_w > 0 { physical_w / logical_w } else { 1 };
     Ok(scale.max(1))
+}
+
+/// Pixel dimensions of the current backing mode, before HiDPI point scaling.
+/// CGDisplayPixelsWide/High report logical dimensions on HiDPI displays.
+pub fn detect_display_pixel_size() -> Result<(u32, u32)> {
+    let mode = core_graphics::display::CGDisplay::main().display_mode()
+        .context("No main display mode found")?;
+    Ok((mode.pixel_width() as u32, mode.pixel_height() as u32))
 }
 
 /// Query the main display's resolution (from ScreenCaptureKit, used for capture sizing)
@@ -717,9 +719,10 @@ impl ScreenCapturer {
 
         // Only ask SCK to rescale when the requested size differs from the display's
         // physical pixel size — otherwise it is a pointless GPU resample pass.
-        let cg_main = core_graphics::display::CGDisplay::main();
-        let needs_scale = actual_width != cg_main.pixels_wide() as u32
-            || actual_height != cg_main.pixels_high() as u32;
+        let needs_scale = detect_display_pixel_size()
+            .map(|(w, h)| actual_width != w || actual_height != h)
+            // This is only a resampling optimization, not a capture prerequisite.
+            .unwrap_or(true);
 
         let captures_audio = audio_tx.is_some();
         let stream_config = SCStreamConfiguration::new()
