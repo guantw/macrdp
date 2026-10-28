@@ -26,7 +26,7 @@ export default function ThemeToggle() {
       <Tooltip>
         <TooltipTrigger
           onClick={cycle}
-          className="flex h-7 w-7 items-center justify-center rounded-md text-text-muted transition-colors hover:bg-accent/8 hover:text-text-secondary"
+          className="flex h-7 items-center justify-center rounded-md px-2 text-text-muted transition-colors hover:bg-accent/8 hover:text-text-secondary"
           render={<button />}
         >
           <Icon size={16} />

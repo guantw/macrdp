@@ -111,7 +111,7 @@ function Sidebar() {
           <Info size={16} />
           <span>关于</span>
         </Link>
-        <div className="mt-2 flex items-center px-2">
+        <div className="mt-2 flex items-center">
           <ThemeToggle />
         </div>
       </div>
