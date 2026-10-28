@@ -113,7 +113,7 @@ impl ServerHandle {
         let gfx = self.gfx_state.lock().unwrap();
         let net_ms = (gfx.rtt_ewma_ms - gfx.last_encode_ms).max(0.0);
         Metrics {
-            fps: 0, // Actual FPS comes from config/runtime
+            fps: gfx.output_fps,
             bitrate_kbps: 0,
             rtt_ms: gfx.rtt_ewma_ms,
             bytes_sent: gfx.total_bytes_sent,
@@ -413,15 +413,17 @@ async fn start_server_inner(
     // Spawn metrics ticker (1 second interval) — all types here are Send
     let metrics_gfx = Arc::clone(&gfx_state);
     let handler_for_metrics = Arc::clone(&handler);
-    let metrics_fps = Arc::clone(&hot_fps);
     let metrics_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        // Tokio's first tick is immediate; allow a full sampling interval first.
+        interval.tick().await;
         let mut prev_bytes_sent: u64 = 0;
         loop {
             interval.tick().await;
-            let (rtt_ms, bytes_sent, encode_ms, last_frame_bytes, network_quality, pending_acks) = {
-                let gfx = metrics_gfx.lock().unwrap();
+            let (fps, rtt_ms, bytes_sent, encode_ms, last_frame_bytes, network_quality, pending_acks) = {
+                let mut gfx = metrics_gfx.lock().unwrap();
                 (
+                    gfx.sample_output_fps(Instant::now()),
                     gfx.rtt_ewma_ms,
                     gfx.total_bytes_sent,
                     gfx.last_encode_ms,
@@ -439,7 +441,7 @@ async fn start_server_inner(
                 .unwrap_or_default()
                 .as_secs();
             handler_for_metrics.on_metrics(Metrics {
-                fps: metrics_fps.load(Ordering::Relaxed),
+                fps,
                 bitrate_kbps,
                 rtt_ms,
                 bytes_sent,

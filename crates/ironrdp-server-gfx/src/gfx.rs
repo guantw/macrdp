@@ -251,6 +251,11 @@ pub struct GfxState {
     pub last_frame_bytes: u32,
     /// Total bytes sent
     pub total_bytes_sent: u64,
+    /// Completed display frame writes per second in the latest metrics interval.
+    /// Includes GFX and bitmap frames, excludes pointer updates.
+    pub output_fps: u32,
+    frames_since_sample: u32,
+    fps_sample_at: std::time::Instant,
     /// Time of first frame sent
     pub start_time: Option<std::time::Instant>,
     /// Client peer IP address (set after TCP connection is established)
@@ -305,6 +310,9 @@ impl GfxState {
             last_encode_ms: 0.0,
             last_frame_bytes: 0,
             total_bytes_sent: 0,
+            output_fps: 0,
+            frames_since_sample: 0,
+            fps_sample_at: std::time::Instant::now(),
             start_time: None,
             peer_addr: None,
             output_suppressed: false,
@@ -321,6 +329,20 @@ impl GfxState {
             max_pointer_size: 32,
             suppress_notify: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Called only after all bytes of a display frame have been written successfully.
+    pub fn record_frame_sent(&mut self) {
+        self.frames_since_sample += 1;
+    }
+
+    /// Sample on the metrics ticker using its actual elapsed time.
+    pub fn sample_output_fps(&mut self, now: std::time::Instant) -> u32 {
+        let elapsed = now.duration_since(self.fps_sample_at).as_secs_f64();
+        self.output_fps = (self.frames_since_sample as f64 / elapsed).round() as u32;
+        self.frames_since_sample = 0;
+        self.fps_sample_at = now;
+        self.output_fps
     }
 
     pub fn next_frame_id(&mut self) -> u32 {
@@ -435,6 +457,10 @@ impl GfxState {
         fresh.chroma_mode = self.chroma_mode.take();
         fresh.max_qp = self.max_qp;
         fresh.suppress_notify = Arc::clone(&self.suppress_notify);
+        // The metrics ticker spans connections. Keep its unfinished sampling window
+        // so a reconnect neither loses sent frames nor shortens the denominator.
+        fresh.frames_since_sample = self.frames_since_sample;
+        fresh.fps_sample_at = self.fps_sample_at;
         *self = fresh;
     }
 
@@ -1206,6 +1232,25 @@ mod tests {
         s.max_pointer_size = 96;
         s.reset_session();
         assert_eq!(s.max_pointer_size, 32, "per-session: a new client re-advertises");
+    }
+
+    #[test]
+    fn output_fps_uses_completed_writes_and_actual_sample_duration() {
+        let mut s = GfxState::new(800, 600, false);
+        let start = s.fps_sample_at;
+        for _ in 0..30 {
+            s.record_frame_sent();
+        }
+        assert_eq!(s.sample_output_fps(start + std::time::Duration::from_secs(2)), 15);
+        // Allocating a protocol frame ID is not a completed write.
+        s.next_frame_id();
+        assert_eq!(s.sample_output_fps(start + std::time::Duration::from_secs(3)), 0);
+
+        s.record_frame_sent();
+        s.reset_session();
+        s.record_frame_sent();
+        assert_eq!(s.sample_output_fps(start + std::time::Duration::from_secs(4)), 2);
+        assert_eq!(s.sample_output_fps(start + std::time::Duration::from_secs(5)), 0);
     }
 
     #[test]

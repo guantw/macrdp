@@ -590,6 +590,7 @@ impl RdpServer {
                     )?;
                     writer.write_all(&data).await
                         .context("failed to write GFX frame")?;
+                    gfx_state.lock().unwrap().record_frame_sent();
 
                     return Ok((RunState::Continue, encoder));
                 }
@@ -607,6 +608,7 @@ impl RdpServer {
                 if let Some(drdynvc_id) = drdynvc_channel_id {
                     let channel_id = state.channel_id.unwrap();
                     let pdu_data = GfxHandler::create_uncompressed_pdu(&mut state, uncompressed);
+                    let has_frame = !pdu_data.is_empty();
                     drop(state);
 
                     let dvc_messages: Vec<dvc::DvcMessage> = vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
@@ -623,6 +625,9 @@ impl RdpServer {
                     )?;
                     writer.write_all(&data).await
                         .context("failed to write GFX uncompressed frame")?;
+                    if has_frame {
+                        gfx_state.lock().unwrap().record_frame_sent();
+                    }
 
                     return Ok((RunState::Continue, encoder));
                 }
@@ -632,6 +637,8 @@ impl RdpServer {
             }
         }
 
+        let is_bitmap = matches!(&update, DisplayUpdate::Bitmap(_));
+        let mut wrote_frame = false;
         let mut encoder_iter = encoder.update(update);
         loop {
             let Some(fragmenter) = encoder_iter.next().await else {
@@ -648,7 +655,12 @@ impl RdpServer {
                     .write_all(&buffer[..len])
                     .await
                     .context("failed to write display update")?;
+                wrote_frame = true;
             }
+        }
+
+        if is_bitmap && wrote_frame {
+            gfx_state.lock().unwrap().record_frame_sent();
         }
 
         Ok((RunState::Continue, encoder))
@@ -1290,6 +1302,89 @@ impl<'a, W: FramedWrite> SharedWriter<'a, W> {
     fn new(writer: &'a mut W) -> Self {
         Self {
             writer: Rc::new(Mutex::new(writer)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::{NonZeroU16, NonZeroUsize};
+    use std::time::{Duration, Instant};
+    use bytes::Bytes;
+    use crate::{BitmapUpdate, GfxFrameUpdate, GfxUncompressedUpdate, PixelFormat, UncompressedRect};
+
+    struct TestWriter {
+        fail: bool,
+        bytes: usize,
+    }
+
+    impl FramedWrite for TestWriter {
+        type WriteAllFut<'a> = std::future::Ready<std::io::Result<()>>;
+
+        fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Self::WriteAllFut<'a> {
+            std::future::ready(if self.fail {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            } else {
+                self.bytes += buf.len();
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn output_fps_counts_sent_frames_but_not_pointers_or_failed_writes() {
+        let frames = [
+            DisplayUpdate::GfxFrame(GfxFrameUpdate {
+                h264_data: Bytes::from_static(&[0, 0, 0, 1, 0x65, 0x88]),
+                width: 64, height: 48, enc_width: 64, enc_height: 48,
+                is_keyframe: true, avc444: false, h264_aux: None,
+            }),
+            DisplayUpdate::GfxUncompressed(GfxUncompressedUpdate {
+                rects: vec![UncompressedRect {
+                    x: 0, y: 0, width: 64, height: 48,
+                    pixel_data: Bytes::from([10, 20, 30, 255].repeat(64 * 48)),
+                }],
+                width: 64, height: 48,
+            }),
+            DisplayUpdate::Bitmap(BitmapUpdate {
+                x: 0, y: 0,
+                width: NonZeroU16::new(64).unwrap(),
+                height: NonZeroU16::new(48).unwrap(),
+                format: PixelFormat::BgrA32,
+                data: Bytes::from([10, 20, 30, 255].repeat(64 * 48)),
+                stride: NonZeroUsize::new(64 * 4).unwrap(),
+            }),
+            DisplayUpdate::RGBAPointer(crate::RGBAPointer {
+                width: 2, height: 2, hot_x: 0, hot_y: 0, data: vec![255; 16],
+            }),
+        ];
+        for update in frames {
+            let is_pointer = matches!(&update, DisplayUpdate::RGBAPointer(_));
+            for fail in [false, true] {
+                let mut state = GfxState::new(64, 48, false);
+                state.channel_id = Some(7);
+                state.caps_confirmed = true;
+                state.avc420_supported = true;
+                let start = Instant::now();
+                state.sample_output_fps(start);
+                let state = Arc::new(std::sync::Mutex::new(state));
+                let encoder = UpdateEncoder::new(
+                    DesktopSize { width: 64, height: 48 },
+                    CmdFlags::empty(), UpdateEncoderCodecs::new(),
+                ).unwrap();
+                let mut writer = TestWriter { fail, bytes: 0 };
+                let result = RdpServer::dispatch_display_update(
+                    update.clone(), &mut writer, 1001, 1003, &mut vec![0; 4096],
+                    encoder, &state, Some(1004),
+                ).await;
+                assert_eq!(result.is_err(), fail);
+                assert_eq!(writer.bytes > 0, !fail);
+                assert_eq!(
+                    state.lock().unwrap().sample_output_fps(start + Duration::from_secs(1)),
+                    u32::from(!fail && !is_pointer),
+                );
+            }
         }
     }
 }

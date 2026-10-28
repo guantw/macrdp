@@ -23,6 +23,7 @@ impl Default for ServerStatus {
 /// Real-time performance metrics
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct Metrics {
+    /// Server display frames successfully written per second, not the configured target.
     pub fps: u32,
     pub bitrate_kbps: u64,
     /// Round-trip time in milliseconds (serialized as "latency_ms" for JSON backward compat)
