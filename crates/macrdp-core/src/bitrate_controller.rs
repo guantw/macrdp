@@ -279,6 +279,16 @@ mod tests {
         }
         let decision = ctrl.evaluate();
         assert_eq!(decision.fps, 30);
+        // At 30 fps, a 20 ms encode fits the new frame budget. The original
+        // 60 fps threshold must not cause another step down.
+        for _ in 0..40 {
+            ctrl.record_frame(FrameStats { encode_ms: 20.0, frame_bytes: 20_000, is_keyframe: false });
+        }
+        assert_eq!(ctrl.evaluate().fps, 30);
+        for _ in 0..40 {
+            ctrl.record_frame(FrameStats { encode_ms: 30.0, frame_bytes: 20_000, is_keyframe: false });
+        }
+        assert_eq!(ctrl.evaluate().fps, 15);
     }
 
     #[test]

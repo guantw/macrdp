@@ -238,8 +238,6 @@ impl RdpServerDisplay for MacDisplay {
             gfx_state: Arc::clone(&self.gfx_state),
             mode_444: self.mode_444,
             display_frame_count: 0,
-            skip_next_frame: false,
-            overload_count: 0,
             idle_frame_count: 0,
             last_idr_time: Instant::now(),
             last_frame_cache: None,
@@ -342,9 +340,6 @@ struct MacDisplayUpdates {
     gfx_state: Arc<Mutex<GfxState>>,
     mode_444: bool,
     display_frame_count: u64,
-    skip_next_frame: bool,
-    /// Counter for rate-limiting encode overload warnings
-    overload_count: u64,
     /// Consecutive idle events from SCK (desktop unchanged).
     idle_frame_count: u32,
     /// When the last IDR keyframe was sent (natural or keepalive).
@@ -377,8 +372,8 @@ struct MacDisplayUpdates {
     /// `GfxState::suppress_notify`: wakes the suppressed wait as soon as the client allows
     /// output again (a static desktop may not produce any capture event to piggyback on).
     suppress_notify: Arc<tokio::sync::Notify>,
-    /// `last_frame_cache` holds a frame the client never received (skipped for overload / ACK
-    /// backlog / throttle / GFX still negotiating). Flushed by `flush_unsent_cache` once the
+    /// `last_frame_cache` holds a frame the client never received (ACK backlog / throttle /
+    /// GFX still negotiating). Flushed by `flush_unsent_cache` once the
     /// desktop is idle or the wait times out — SCK never resends an unchanged frame.
     cache_unsent: bool,
     /// Consecutive `Err` results from the encoder; `ENCODE_FAIL_REBUILD` of them rebuild it.
@@ -1078,14 +1073,6 @@ impl MacDisplayUpdates {
             self.last_frame_cache = Some(CachedFrame::from_frame(&frame));
             return Ok(None);
         }
-        // Encode overload protection: skip this frame if previous encode took too long
-        if self.skip_next_frame {
-            self.skip_next_frame = false;
-            self.last_frame_cache = Some(CachedFrame::from_frame(&frame));
-            self.cache_unsent = true;
-            return Ok(None);
-        }
-
         // AVC444 configured but this client negotiated without it: the 444 encoder session
         // (align16 size, 2× bitrate, BGRA capture + per-frame vImage conversion) buys nothing.
         // Rebuild as AVC420 once per stream — `rebuild_encoder` also switches capture to NV12
@@ -1204,19 +1191,6 @@ impl MacDisplayUpdates {
                                 ps.lock().unwrap().record_frame(encode_ms, total_bytes as u32, is_keyframe);
                             }
                             self.apply_adaptive_decision().await;
-                            let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
-                            if encode_ms > frame_interval_ms * 0.95 {
-                                self.skip_next_frame = true;
-                                self.overload_count += 1;
-                                if self.overload_count % 60 == 1 {
-                                    tracing::warn!(
-                                        encode_ms = format!("{:.1}", encode_ms),
-                                        frame_interval_ms = format!("{:.1}", frame_interval_ms),
-                                        overload_total = self.overload_count,
-                                        "encode overload — skipping frames"
-                                    );
-                                }
-                            }
                             // Cache frame for idle IDR re-encoding. A dropped aux view leaves the
                             // client's chroma stale: flush re-encodes the frame (the encoder resends aux).
                             self.last_frame_cache = Some(cache);
@@ -1286,19 +1260,6 @@ impl MacDisplayUpdates {
                             ps.lock().unwrap().record_frame(encode_ms, encoded.data.len() as u32, is_keyframe);
                         }
                         self.apply_adaptive_decision().await;
-                        let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
-                        if encode_ms > frame_interval_ms * 0.95 {
-                            self.skip_next_frame = true;
-                            self.overload_count += 1;
-                            if self.overload_count % 60 == 1 {
-                                tracing::warn!(
-                                    encode_ms = format!("{:.1}", encode_ms),
-                                    frame_interval_ms = format!("{:.1}", frame_interval_ms),
-                                    overload_total = self.overload_count,
-                                    "encode overload — skipping frames"
-                                );
-                            }
-                        }
                         // Cache frame for idle IDR re-encoding
                         self.last_frame_cache = Some(cache);
                         self.cache_unsent = false;
