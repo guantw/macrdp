@@ -52,6 +52,14 @@ function Popover() {
 
   const metricsAvailable = metrics && !stale;
   const transitioning = status.state === "starting" || status.state === "stopping";
+  const metricItems = [
+    { label: "FPS", value: metricsAvailable ? metrics.fps.toFixed(0) : "--" },
+    { label: "Mbps", value: metricsAvailable ? (metrics.bitrate_kbps / 1000).toFixed(1) : "--" },
+    { label: "RTT (ms)", value: metricsAvailable ? metrics.latency_ms.toFixed(1) : "--" },
+    { label: "编码 (ms)", value: metricsAvailable ? metrics.encode_ms.toFixed(1) : "--" },
+    { label: "网络 (ms)", value: metricsAvailable ? metrics.net_ms.toFixed(1) : "--" },
+    { label: "流量", value: metricsAvailable ? formatBytes(metrics.bytes_sent) : "--" },
+  ];
 
   const handleToggle = async () => {
     try {
@@ -90,7 +98,7 @@ function Popover() {
   const extraCount = connections.length - 3;
 
   return (
-    <div ref={contentRef} className="bg-[rgba(245,245,247,0.95)] backdrop-blur-xl rounded-xl overflow-hidden shadow-2xl">
+    <div ref={contentRef} className="bg-bg/95 backdrop-blur-xl rounded-xl overflow-hidden shadow-2xl">
       <div className="flex flex-col p-3.5 gap-3">
         {/* Header row */}
         <div className="flex items-center justify-between">
@@ -148,47 +156,17 @@ function Popover() {
           </div>
         </div>
 
-        {/* Metrics row - 6 columns */}
-        <div className="grid grid-cols-6 gap-1">
-          <div className="flex flex-col items-center justify-center rounded-md bg-muted/50 py-2 px-0.5">
-            <span className="text-sm font-semibold text-foreground">
-              {metricsAvailable ? metrics.fps : "--"}
-            </span>
-            <span className="text-[10px] text-muted-foreground">FPS</span>
-          </div>
-          <div className="flex flex-col items-center justify-center rounded-md bg-muted/50 py-2 px-0.5">
-            <span className="text-sm font-semibold text-foreground">
-              {metricsAvailable
-                ? (metrics.bitrate_kbps / 1000).toFixed(1)
-                : "--"}
-            </span>
-            <span className="text-[10px] text-muted-foreground">M</span>
-          </div>
-          <div className="flex flex-col items-center justify-center rounded-md bg-muted/50 py-2 px-0.5">
-            <span className="text-sm font-semibold text-foreground">
-              {metricsAvailable ? metrics.latency_ms : "--"}
-            </span>
-            <span className="text-[10px] text-muted-foreground">RTT</span>
-          </div>
-          <div className="flex flex-col items-center justify-center rounded-md bg-muted/50 py-2 px-0.5">
-            <span className="text-sm font-semibold text-foreground">
-              {metricsAvailable ? metrics.encode_ms : "--"}
-            </span>
-            <span className="text-[10px] text-muted-foreground">编码</span>
-          </div>
-          <div className="flex flex-col items-center justify-center rounded-md bg-muted/50 py-2 px-0.5">
-            <span className="text-sm font-semibold text-foreground">
-              {metricsAvailable ? metrics.net_ms : "--"}
-            </span>
-            <span className="text-[10px] text-muted-foreground">网络</span>
-          </div>
-          <div className="flex flex-col items-center justify-center rounded-md bg-muted/50 py-2 px-0.5">
-            <span className="text-sm font-semibold text-foreground">
-              {metricsAvailable ? formatBytes(metrics.bytes_sent) : "--"}
-            </span>
-            <span className="text-[10px] text-muted-foreground">流量</span>
-          </div>
-        </div>
+        {/* Two rows leave room for formatted values and units at 300px wide. */}
+        <dl className="grid grid-cols-3 gap-1.5">
+          {metricItems.map(({ label, value }) => (
+            <div key={label} className="flex min-w-0 flex-col items-center rounded-md bg-muted/50 px-1 py-2">
+              <dd title={value} className="w-full truncate text-center text-sm font-semibold tabular-nums text-foreground">
+                {value}
+              </dd>
+              <dt className="mt-0.5 text-[10px] text-muted-foreground">{label}</dt>
+            </div>
+          ))}
+        </dl>
 
         {/* Connection list */}
         <div>
