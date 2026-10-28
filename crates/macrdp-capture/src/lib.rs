@@ -910,6 +910,32 @@ mod tests {
     use core_graphics::color_space::CGColorSpace;
     use core_graphics::context::CGContext;
     use core_graphics::image::CGImage;
+    /// SCStream copies its configuration before capture starts. The color properties
+    /// borrow CFString pointers, so their owners must survive the setter calls.
+    /// This exercises that native copy without enumerating displays or capturing pixels.
+    #[test]
+    fn capture_color_configuration_survives_native_copy() {
+        use objc2::{msg_send, rc::{autoreleasepool, Retained}, runtime::AnyObject};
+        use screencapturekit::ffi;
+
+        unsafe {
+            let config = ffi::sc_stream_configuration_create();
+            autoreleasepool(|_| {
+                ffi::sc_stream_configuration_set_color_matrix(config, b"ITU_R_601_4\0".as_ptr().cast());
+                ffi::sc_stream_configuration_set_color_space_name(config, b"kCGColorSpaceSRGB\0".as_ptr().cast());
+            });
+            let copy: Retained<AnyObject> = msg_send![config.cast::<AnyObject>(), copy];
+            let matrix: *const AnyObject = msg_send![&*copy, colorMatrix];
+            let space: *const AnyObject = msg_send![&*copy, colorSpaceName];
+            let matrix_value: *const std::ffi::c_char = msg_send![matrix, UTF8String];
+            let space_value: *const std::ffi::c_char = msg_send![space, UTF8String];
+            assert_eq!(std::ffi::CStr::from_ptr(matrix_value).to_str().unwrap(), "ITU_R_601_4");
+            assert_eq!(std::ffi::CStr::from_ptr(space_value).to_str().unwrap(), "kCGColorSpaceSRGB");
+            drop(copy);
+            ffi::sc_stream_configuration_release(config);
+        }
+    }
+
 
     /// Build a solid-colour BGRA CGImage of the given size (no screen access needed).
     fn solid_image(w: usize, h: usize, bgra: [u8; 4]) -> CGImage {
