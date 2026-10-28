@@ -153,4 +153,10 @@ optional = true
 
 [dev-dependencies.tokio]
 version = "1"
-features = ["sync"]
+features = ["sync", "time"]
+
+[dev-dependencies.ironrdp-connector]
+version = "0.8"
+
+[dev-dependencies.rcgen]
+version = "0.13"

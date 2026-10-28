@@ -538,14 +538,12 @@ impl Sequence for Acceptor {
                         "Credential check (non-hybrid)"
                     );
 
-                    // Compare username and password only, ignore domain mismatch.
-                    // Accept empty client password — Windows mstsc sends empty creds on
-                    // first connect before prompting the user. Rejecting causes mstsc to
-                    // show an error instead of a login dialog.
+                    // This server uses its configured local account; the client's domain
+                    // qualifier is not an identity provider. An omitted password is not
+                    // authentication and must not grant access to the desktop.
                     let creds_match = self.creds.as_ref().is_some_and(|server_creds| {
-                        creds.password.is_empty()
-                            || (server_creds.username == creds.username
-                                && server_creds.password == creds.password)
+                        server_creds.username == creds.username
+                            && server_creds.password == creds.password
                     });
 
                     if !creds_match {
@@ -553,10 +551,6 @@ impl Sequence for Acceptor {
                             client_user = %creds.username,
                             client_domain = ?creds.domain,
                             server_user = ?self.creds.as_ref().map(|c| &c.username),
-                            client_pass_len = creds.password.len(),
-                            server_pass_len = ?self.creds.as_ref().map(|c| c.password.len()),
-                            client_pass_bytes = ?creds.password.as_bytes(),
-                            server_pass_bytes = ?self.creds.as_ref().map(|c| c.password.as_bytes()),
                             "Credential mismatch — rejecting"
                         );
                         let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(

@@ -19,6 +19,9 @@ mod helper;
 mod server;
 mod sound;
 
+#[cfg(test)]
+mod connection_tests;
+
 pub use clipboard::*;
 pub use display::*;
 pub use handler::*;
