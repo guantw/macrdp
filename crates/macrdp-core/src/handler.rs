@@ -103,15 +103,15 @@ impl MacInputHandler {
 
 impl RdpServerInputHandler for MacInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
-        let Some(kb) = &self.keyboard else { return };
+        let Some(kb) = &mut self.keyboard else { return };
 
         let result = match event {
             KeyboardEvent::Pressed { code, extended } => kb.inject_key(code, extended, true),
             KeyboardEvent::Released { code, extended } => kb.inject_key(code, extended, false),
             KeyboardEvent::UnicodePressed(ch) => kb.inject_unicode(ch, true),
             KeyboardEvent::UnicodeReleased(ch) => kb.inject_unicode(ch, false),
-            KeyboardEvent::Synchronize(_flags) => {
-                tracing::debug!("Keyboard synchronize event (ignored)");
+            KeyboardEvent::Synchronize(flags) => {
+                kb.synchronize(flags.bits() & 0x04 != 0); // RDP CAPS_LOCK toggle
                 Ok(())
             }
         };
