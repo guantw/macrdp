@@ -472,9 +472,9 @@ impl RdpServer {
                     if let Err(error) = self.run_connection(stream).await {
                         let err_str = format!("{error:#}");
                         if err_str.contains("reset by peer") || err_str.contains("Broken pipe") {
-                            warn!("Client disconnected: {err_str}");
+                            warn!(%peer, "Client disconnected: {err_str}");
                         } else {
-                            error!(?error, "Connection error");
+                            error!(%peer, ?error, "Connection error");
                         }
                     }
                     info!("Ready for next connection");
@@ -774,7 +774,8 @@ impl RdpServer {
         W: FramedWrite,
     {
         debug!("Starting client loop");
-        let mut display_updates = self.display.lock().await.updates().await?;
+        let mut display_updates = self.display.lock().await.updates().await
+            .context("failed to initialize display after authentication")?;
         let mut writer = SharedWriter::new(writer);
         let mut display_writer = writer.clone();
         let mut event_writer = writer.clone();

@@ -55,13 +55,39 @@ impl<S: Subscriber> Layer<S> for LogBridgeLayer {
         };
 
         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-        // Write as JSON line (no serde needed, simple format)
-        let _ = writeln!(file, r#"{{"level":"{}","message":"{}","timestamp":"{}"}}"#,
-            level.to_lowercase(),
-            message.replace('\\', "\\\\").replace('"', "\\\""),
-            ts,
-        );
+        let _ = write_entry(&mut *file, level, message, &ts.to_string());
         let _ = file.flush();
+    }
+}
+
+fn write_entry(writer: &mut impl Write, level: &str, message: &str, timestamp: &str) -> std::io::Result<()> {
+    // Error chains contain literal newlines. Every event must remain one valid JSONL
+    // line because the UI reads and parses the file one line at a time.
+    serde_json::to_writer(&mut *writer, &serde_json::json!({
+        "level": level.to_lowercase(),
+        "message": message,
+        "timestamp": timestamp,
+    }))?;
+    writeln!(writer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_entry;
+
+    #[test]
+    fn multiline_errors_survive_the_ui_line_parser() {
+        let message = "Connection error\n\nCaused by:\n    No display found\r\n\t\"quoted\" \\ \u{0}";
+        let mut bytes = Vec::new();
+        write_entry(&mut bytes, "ERROR", message, "2026-10-27 12:00:00.000").unwrap();
+        write_entry(&mut bytes, "WARN", "next event", "2026-10-27 12:00:01.000").unwrap();
+        let content = String::from_utf8(bytes).unwrap();
+        let entries: Vec<serde_json::Value> = content.lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["message"], message);
+        assert_eq!(entries[0]["level"], "error");
+        assert_eq!(entries[1]["message"], "next event");
     }
 }
 
