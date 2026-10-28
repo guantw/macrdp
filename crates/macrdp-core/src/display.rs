@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::bitrate_controller::{BitrateController, FrameStats, NetworkQuality, is_private_ip};
 use crate::cursor::CursorWatcher;
+use crate::display_power::DisplayPower;
 use crate::handler::MouseCoordMapper;
 use crate::perf_stats::SharedPerfStats;
 
@@ -138,6 +139,11 @@ impl RdpServerDisplay for MacDisplay {
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+        // The server enters updates only after authentication/finalization. Keep this
+        // guard local until initialization succeeds, then transfer it to the stream.
+        let display_power = DisplayPower::acquire()
+            .map_err(|error| tracing::warn!(%error, "Display power request failed"))
+            .ok();
         // Apply hot-updated settings (written by the config task into GfxState / hot_fps).
         // fps first: an explicit target_bitrate must win over the fps-derived default.
         let hot_fps = self.hot_fps.load(Ordering::Relaxed);
@@ -196,7 +202,7 @@ impl RdpServerDisplay for MacDisplay {
         // Read the current audio sender from the shared slot (set by AudioFactory per connection)
         let audio_tx = self.shared_audio_tx.as_ref()
             .and_then(|shared| shared.lock().unwrap().clone());
-        let capturer = ScreenCapturer::new(capture_config.clone(), audio_tx).await?;
+        let capturer = ScreenCapturer::new_when_display_ready(capture_config.clone(), audio_tx).await?;
 
         let (peer_addr, max_pointer, suppress_notify) = {
             let gfx = self.gfx_state.lock().unwrap();
@@ -213,6 +219,7 @@ impl RdpServerDisplay for MacDisplay {
 
         Ok(Box::new(MacDisplayUpdates {
             capturer,
+            _display_power: display_power,
             cursor,
             capture_config,
             encoder,
@@ -313,6 +320,7 @@ const SCK_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 struct MacDisplayUpdates {
     capturer: ScreenCapturer,
+    _display_power: Option<DisplayPower>,
     /// Client-side cursor: pointer PDU on shape change (None = cursor is in the video frame).
     cursor: Option<CursorWatcher>,
     capture_config: CaptureConfig,

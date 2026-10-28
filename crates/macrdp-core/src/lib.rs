@@ -5,6 +5,7 @@ pub mod callbacks;
 pub mod config;
 pub mod cursor;
 pub mod display;
+mod display_power;
 pub mod handler;
 pub mod log_bridge;
 pub mod permissions;

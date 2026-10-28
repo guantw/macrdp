@@ -9,6 +9,7 @@ use core_graphics::access::ScreenCaptureAccess;
 use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
 use screencapturekit::prelude::*;
 use screencapturekit::stream::configuration::{AudioChannelCount, AudioSampleRate};
+use screencapturekit::stream::delegate_trait::SCStreamDelegateTrait;
 use tokio::sync::mpsc;
 
 /// Check if Screen Recording permission is granted (no prompt)
@@ -155,9 +156,53 @@ impl Drop for SckBusyGuard {
 
 fn sck_claim(busy: &SckBusy, what: &str) -> Result<SckBusyGuard> {
     if busy.swap(true, std::sync::atomic::Ordering::AcqRel) {
-        anyhow::bail!("SCStream {what}: an earlier SCK call on this stream is still hung — not issuing another");
+        anyhow::bail!("ScreenCaptureKit {what}: an earlier call is still pending");
     }
     Ok(SckBusyGuard(Arc::clone(busy)))
+}
+
+/// Content enumeration also waits on an unbounded SCK completion callback. Bound the
+/// wait and allow only one outstanding enumeration, including after a caller times out.
+fn shareable_content() -> Result<SCShareableContent> {
+    static BUSY: std::sync::OnceLock<SckBusy> = std::sync::OnceLock::new();
+    sck_call_timeout(
+        BUSY.get_or_init(SckBusy::default),
+        "getShareableContent",
+        std::time::Duration::from_secs(5),
+        SCShareableContent::get,
+        || {},
+    )
+    .context("Failed to query shareable content")
+}
+
+async fn query_display() -> Result<Option<SCDisplay>> {
+    tokio::task::spawn_blocking(|| {
+        let content = shareable_content()?;
+        let main_id = core_graphics::display::CGDisplay::main().id;
+        Ok(content.displays().into_iter().find(|display| display.display_id() == main_id))
+    }).await?
+}
+
+/// Retry only a successful query with no displays, as can happen during display wake.
+/// Permission/query errors are returned immediately instead of being hidden by retries.
+async fn wait_for_display<T, F, Fut>(mut query: F, timeout: std::time::Duration) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<T>>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(display) = tokio::time::timeout_at(deadline, query()).await
+            .context("Timed out querying shareable displays")??
+        {
+            return Ok(display);
+        }
+        let next_query = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+        tokio::time::sleep_until(next_query.min(deadline)).await;
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("No display found after waiting {timeout:?} for the display to wake");
+        }
+    }
 }
 
 /// Run a blocking SCK call (whose crate wrapper waits unbounded on the completion callback)
@@ -178,17 +223,18 @@ fn sck_call_timeout<T: Send + 'static>(
     std::thread::Builder::new()
         .name(format!("sck-{what}"))
         .spawn(move || {
-            let _guard = guard;
             let r = f();
-            if let Err(std::sync::mpsc::SendError(Ok(_))) = tx.send(r) {
+            // Transfer the guard with the result so the caller releases it before
+            // returning. On a late success, retain it through cleanup instead.
+            if let Err(std::sync::mpsc::SendError((Ok(_), _guard))) = tx.send((r, guard)) {
                 tracing::warn!("SCStream {what} completed after the caller gave up");
                 undo_late();
             }
         })
         .context("spawn SCK helper thread")?;
     match rx.recv_timeout(timeout) {
-        Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(anyhow::anyhow!("SCStream {what} failed: {e:?}")),
+        Ok((Ok(v), _guard)) => Ok(v),
+        Ok((Err(e), _guard)) => Err(anyhow::anyhow!("SCStream {what} failed: {e:?}")),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!("SCStream {what} timed out after {timeout:?}")),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!("SCStream {what} helper thread panicked")),
     }
@@ -303,6 +349,23 @@ struct VideoOutputHandler {
     pixel_format: CapturePixelFormat,
     /// Unread frames replaced by a newer one (consumer slower than capture).
     dropped: std::sync::atomic::AtomicU64,
+}
+
+struct CaptureDelegate {
+    slot: Arc<LatestSlot<CaptureEvent>>,
+}
+
+impl SCStreamDelegateTrait for CaptureDelegate {
+    fn did_stop_with_error(&self, error: SCError) {
+        tracing::warn!(%error, "Screen capture stopped");
+        self.slot.close();
+    }
+
+    fn stream_did_stop(&self, _error: Option<String>) {
+        // Wake next_frame so the display layer can run its existing fallback/rebuild
+        // path. Without this, a stopped stream leaves it waiting forever for a frame.
+        self.slot.close();
+    }
 }
 
 /// Log one debug line per this many dropped frames.
@@ -579,12 +642,12 @@ pub fn detect_display_scale() -> Result<u32> {
 
 /// Query the main display's resolution (from ScreenCaptureKit, used for capture sizing)
 pub fn detect_display_size() -> Result<(u32, u32)> {
-    let content = SCShareableContent::get()
-        .context("Failed to get shareable content")?;
+    let content = shareable_content()?;
+    let main_id = core_graphics::display::CGDisplay::main().id;
     let display = content
         .displays()
         .into_iter()
-        .next()
+        .find(|display| display.display_id() == main_id)
         .context("No display found")?;
     Ok((display.width(), display.height()))
 }
@@ -613,16 +676,26 @@ impl ScreenCapturer {
         config: CaptureConfig,
         audio_tx: Option<mpsc::Sender<AudioFrame>>,
     ) -> Result<Self> {
-        // SCShareableContent::get() is synchronous, run in blocking task
-        let content = tokio::task::spawn_blocking(SCShareableContent::get)
-            .await?
-            .context("Failed to get shareable content (Screen Recording permission needed)")?;
+        let display = query_display().await?.context("No display found")?;
+        Self::for_display(config, audio_tx, display).await
+    }
 
-        let display = content
-            .displays()
-            .into_iter()
-            .next()
-            .context("No display found")?;
+    /// Initial connection after the authenticated session requests display wake.
+    /// Existing-stream recovery uses `new` so it can still serve CoreGraphics frames
+    /// between SCK rebuild attempts instead of waiting through this wake grace period.
+    pub async fn new_when_display_ready(
+        config: CaptureConfig,
+        audio_tx: Option<mpsc::Sender<AudioFrame>>,
+    ) -> Result<Self> {
+        let display = wait_for_display(query_display, std::time::Duration::from_secs(5)).await?;
+        Self::for_display(config, audio_tx, display).await
+    }
+
+    async fn for_display(
+        config: CaptureConfig,
+        audio_tx: Option<mpsc::Sender<AudioFrame>>,
+        display: SCDisplay,
+    ) -> Result<Self> {
 
         let actual_width = if config.width == 0 {
             display.width() as u32
@@ -687,7 +760,11 @@ impl ScreenCapturer {
             dropped: std::sync::atomic::AtomicU64::new(0),
         };
 
-        let mut stream = SCStream::new(&filter, &stream_config);
+        let mut stream = SCStream::new_with_delegate(
+            &filter,
+            &stream_config,
+            CaptureDelegate { slot: Arc::clone(&slot) },
+        );
         stream.add_output_handler(video_handler, SCStreamOutputType::Screen);
 
         // Register audio handler only if a sender was provided
@@ -936,6 +1013,55 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn initial_capture_waits_for_a_display_to_reappear() {
+        let attempts = std::cell::Cell::new(0);
+        let display = wait_for_display(|| {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            std::future::ready(Ok((attempt == 3).then_some(42)))
+        }, std::time::Duration::from_secs(5)).await.unwrap();
+        assert_eq!(display, 42);
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn display_wait_is_bounded_and_does_not_retry_query_errors() {
+        let timeout = std::time::Duration::from_secs(1);
+        let start = tokio::time::Instant::now();
+        let error = wait_for_display(|| std::future::ready(Ok(None::<()>)), timeout).await.unwrap_err();
+        assert!(error.to_string().contains("No display found"));
+        assert_eq!(start.elapsed(), timeout);
+
+        let attempts = std::cell::Cell::new(0);
+        let error = wait_for_display(|| {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(Err::<Option<()>, _>(anyhow::anyhow!("screen capture access denied")))
+        }, timeout).await.unwrap_err();
+        assert_eq!(error.to_string(), "screen capture access denied");
+        assert_eq!(attempts.get(), 1);
+
+        let error = wait_for_display(std::future::pending::<Result<Option<()>>>, timeout).await.unwrap_err();
+        assert!(error.to_string().contains("Timed out querying"));
+    }
+
+    #[tokio::test]
+    async fn capture_stop_notifies_the_display_recovery_loop() {
+        for with_error in [false, true] {
+            let slot = Arc::new(LatestSlot::default());
+            let receiver = Arc::clone(&slot);
+            let waiter = tokio::spawn(async move { receiver.take().await });
+            tokio::task::yield_now().await;
+            let delegate = CaptureDelegate { slot };
+            if with_error {
+                delegate.did_stop_with_error(SCError::StreamError("display disconnected".into()));
+            } else {
+                delegate.stream_did_stop(None);
+            }
+            assert!(tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await.unwrap().unwrap().is_none());
+        }
+    }
 
     /// Build a solid-colour BGRA CGImage of the given size (no screen access needed).
     fn solid_image(w: usize, h: usize, bgra: [u8; 4]) -> CGImage {
