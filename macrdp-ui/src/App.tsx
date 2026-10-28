@@ -3,6 +3,7 @@ import { Routes, Route, useNavigate } from "react-router-dom";
 import Sidebar from "./components/Sidebar";
 import Dashboard from "./pages/Dashboard";
 import Settings from "./pages/Settings";
+import KeyboardSettings from "./pages/KeyboardSettings";
 import Permissions from "./pages/Permissions";
 import Logs from "./pages/Logs";
 import Statistics from "./pages/Statistics";
@@ -48,11 +49,12 @@ function MainLayout() {
   return (
     <div className="flex h-screen w-screen overflow-hidden">
       <Sidebar />
-      <div className="flex flex-1 flex-col overflow-hidden">
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <main className="flex-1 overflow-auto bg-bg p-6">
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/settings" element={<Settings />} />
+            <Route path="/keyboard" element={<KeyboardSettings />} />
             <Route path="/permissions" element={<Permissions />} />
             <Route path="/logs" element={<Logs />} />
             <Route path="/statistics" element={<Statistics />} />

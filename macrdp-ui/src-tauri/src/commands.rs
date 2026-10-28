@@ -152,6 +152,26 @@ pub async fn get_config(
 }
 
 #[tauri::command]
+pub fn get_keyboard_keys() -> &'static [macrdp_core::KeyOption] {
+    macrdp_core::KEY_OPTIONS
+}
+
+#[tauri::command]
+pub async fn set_keyboard_recording(
+    session: Option<u32>,
+    window: tauri::WebviewWindow,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    if session.is_some() && !window.is_focused().map_err(|e| e.to_string())? {
+        return Err("The mapping editor must be focused".into());
+    }
+    if let Some(handle) = state.server_handle.lock().await.as_ref() {
+        handle.set_keyboard_recording(session);
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn set_config(
     app: tauri::AppHandle,
     key: String,
@@ -162,8 +182,10 @@ pub async fn set_config(
 
     let restart_required = {
         let mut config = state.ui_config.lock().await;
-        let restart = config.set_field(&key, &value)?;
-        config.save()?;
+        let mut updated = config.clone();
+        let restart = updated.set_field(&key, &value)?;
+        updated.save()?;
+        *config = updated;
         restart
     };
 
@@ -180,6 +202,7 @@ pub async fn set_config(
                 "resolution" | "hidpi_scale" => handle.update_config(macrdp_core::ConfigUpdate::Resolution(config.resolution.clone())),
                 "encoder" => handle.update_config(macrdp_core::ConfigUpdate::Encoder(config.encoder.clone())),
                 "chroma_mode" => handle.update_config(macrdp_core::ConfigUpdate::ChromaMode(config.chroma_mode.clone())),
+                "keyboard_mappings" => handle.update_keyboard_mappings(config.keyboard_mappings.clone()),
                 "username" | "password" => handle.update_config(macrdp_core::ConfigUpdate::Credentials {
                     username: config.username.clone(),
                     password: config.password.clone(),

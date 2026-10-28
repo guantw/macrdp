@@ -71,6 +71,32 @@ export interface UiConfig {
   autostart: boolean;
   tls_cert_path: string;
   tls_key_path: string;
+  keyboard_mappings: KeyMapping[];
+}
+
+export type KeyModifier = "shift" | "control" | "alt" | "meta";
+
+export interface KeyChord {
+  key: string;
+  modifiers: KeyModifier[];
+}
+
+export interface KeyMapping {
+  from: KeyChord;
+  to: KeyChord;
+}
+
+export interface KeyOption {
+  id: string;
+  windows: string;
+  mac: string;
+  group: string;
+}
+
+export interface RecordedKey {
+  session: number;
+  key: string | null;
+  pressed: boolean;
 }
 
 /** @deprecated Use UiConfig instead */

@@ -3,6 +3,7 @@ import { Link, useLocation } from "react-router-dom";
 import {
   Monitor,
   Settings,
+  Keyboard,
   Shield,
   FileText,
   Activity,
@@ -21,6 +22,7 @@ const navGroups = [
     label: "配置",
     items: [
       { path: "/settings", icon: Settings, label: "设置" },
+      { path: "/keyboard", icon: Keyboard, label: "按键映射" },
       { path: "/permissions", icon: Shield, label: "权限" },
     ],
   },

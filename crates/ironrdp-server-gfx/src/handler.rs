@@ -73,6 +73,8 @@ pub enum MouseEvent {
 pub trait RdpServerInputHandler: Send {
     fn keyboard(&mut self, event: KeyboardEvent);
     fn mouse(&mut self, event: MouseEvent);
+    /// Release any injected keys when the client connection ends.
+    fn release_all(&mut self) {}
 }
 
 impl From<(u8, fast_path::KeyboardFlags)> for KeyboardEvent {

@@ -96,6 +96,10 @@ Generated TLS certificates default to `tls/` inside the selected config director
 
 GUI settings are stored separately in `~/.macrdp/config-ui.toml`.
 
+Add, edit, or delete mappings on the main window's Key Mapping page. Click either side to record a key or chord, or use the searchable picker for special keys and modifiers. Release a key to finish, press Escape to cancel, or Tab to leave; switching windows or leaving the page stops recording. Remote source recording captures input before mapping and does not inject it. Saving applies to the current connection without restarting or reconnecting, and saved rules are restored when the app restarts.
+
+Custom rules start empty. Unmatched keys retain the existing map (Ctrl → Control, Alt → Command, Win → Option). Chords match the original remote modifiers exactly and take precedence over single-key rules; single-key rules preserve other held modifiers.
+
 ---
 
 ## Project Structure

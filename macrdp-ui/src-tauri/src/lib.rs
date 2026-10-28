@@ -74,6 +74,14 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 let w = window.clone();
                 window.on_window_event(move |event| {
+                    if matches!(event, tauri::WindowEvent::Focused(false) | tauri::WindowEvent::CloseRequested { .. }) {
+                        let state = w.state::<Arc<state::AppState>>().inner().clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Some(handle) = state.server_handle.lock().await.as_ref() {
+                                handle.set_keyboard_recording(None);
+                            }
+                        });
+                    }
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
                         let _ = w.hide();
@@ -101,6 +109,8 @@ pub fn run() {
             commands::get_connections,
             commands::get_permissions,
             commands::get_config,
+            commands::get_keyboard_keys,
+            commands::set_keyboard_recording,
             commands::set_config,
             commands::get_logs,
             commands::get_connection_history,

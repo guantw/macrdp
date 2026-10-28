@@ -32,6 +32,7 @@ pub struct UiConfig {
     pub log_level: String,
     pub theme: String,
     pub autostart: bool,
+    pub keyboard_mappings: macrdp_core::KeyboardMappings,
 }
 
 impl Default for UiConfig {
@@ -52,6 +53,7 @@ impl Default for UiConfig {
             log_level: "warn".to_string(),
             theme: "system".to_string(),
             autostart: false,
+            keyboard_mappings: macrdp_core::KeyboardMappings::default(),
         }
     }
 }
@@ -65,14 +67,16 @@ pub fn config_path() -> PathBuf {
 }
 
 impl UiConfig {
-    /// Load from `~/.macrdp/config-ui.toml`, creating defaults if the file
-    /// does not exist or is unparseable.
+    /// Load from `~/.macrdp/config-ui.toml`, creating defaults if the file is absent.
     pub fn load() -> Result<Self, String> {
-        let path = config_path();
+        Self::load_from(&config_path())
+    }
+
+    fn load_from(path: &std::path::Path) -> Result<Self, String> {
         if !path.exists() {
             let cfg = Self::default();
             // Try to persist the defaults so the user has a file to edit.
-            let _ = cfg.save();
+            let _ = cfg.save_to(path);
             return Ok(cfg);
         }
         let content =
@@ -82,7 +86,10 @@ impl UiConfig {
 
     /// Serialize to TOML and write to `~/.macrdp/config-ui.toml`.
     pub fn save(&self) -> Result<(), String> {
-        let path = config_path();
+        self.save_to(&config_path())
+    }
+
+    fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("create config dir: {e}"))?;
@@ -102,6 +109,10 @@ impl UiConfig {
         value: &serde_json::Value,
     ) -> Result<bool, String> {
         match key {
+            "keyboard_mappings" => {
+                self.keyboard_mappings = serde_json::from_value(value.clone())
+                    .map_err(|error| format!("Invalid keyboard mappings: {error}"))?;
+            }
             "port" => {
                 self.port = value
                     .as_u64()
@@ -230,6 +241,49 @@ impl UiConfig {
             max_qp: None,
             audio: macrdp_core::AudioConfig::default(),
             clipboard: macrdp_core::ClipboardConfig::default(),
+            keyboard_mappings: self.keyboard_mappings.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn keyboard_mappings_survive_save_reload_edit_and_delete() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config-ui.toml");
+        // Upgrade from a config with no keyboard settings keeps the old defaults.
+        std::fs::write(&path, "port = 13389\ntheme = 'dark'\n").unwrap();
+        let mut config = UiConfig::load_from(&path).unwrap();
+        assert_eq!(serde_json::to_value(&config.keyboard_mappings).unwrap(), json!([]));
+        let mut rules = json!([
+            {"from": {"key": "left_control", "modifiers": []}, "to": {"key": "left_meta", "modifiers": []}},
+            {"from": {"key": "insert", "modifiers": ["shift"]}, "to": {"key": "v", "modifiers": ["meta"]}}
+        ]);
+        assert!(!config.set_field("keyboard_mappings", &rules).unwrap());
+        config.save_to(&path).unwrap();
+        let mut loaded = UiConfig::load_from(&path).unwrap();
+        assert_eq!(serde_json::to_value(&loaded.keyboard_mappings).unwrap(), rules);
+        assert_eq!(serde_json::to_value(loaded.to_server_config().keyboard_mappings).unwrap(), rules);
+        assert_eq!(loaded.port, 13389);
+        assert_eq!(loaded.theme, "dark");
+
+        rules[0]["to"]["key"] = json!("left_alt");
+        loaded.set_field("keyboard_mappings", &rules).unwrap();
+        loaded.save_to(&path).unwrap();
+        let mut edited = UiConfig::load_from(&path).unwrap();
+        assert_eq!(serde_json::to_value(&edited.keyboard_mappings).unwrap(), rules);
+        let invalid = json!([rules[0].clone(), rules[0].clone()]);
+        assert!(edited.set_field("keyboard_mappings", &invalid).is_err());
+        assert_eq!(serde_json::to_value(&edited.keyboard_mappings).unwrap(), rules);
+
+        edited.set_field("keyboard_mappings", &json!([])).unwrap();
+        edited.save_to(&path).unwrap();
+        let cleared = UiConfig::load_from(&path).unwrap();
+        assert_eq!(serde_json::to_value(&cleared.keyboard_mappings).unwrap(), json!([]));
+        assert_eq!(cleared.port, 13389);
     }
 }

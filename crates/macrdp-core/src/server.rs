@@ -54,7 +54,7 @@ pub(crate) fn resolve_resolution_with_pixels(
 use std::net::{SocketAddr, TcpListener};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, RwLock,
 };
 use std::time::Instant;
 
@@ -81,6 +81,8 @@ pub struct ServerHandle {
     server_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     metrics_task: Mutex<Option<JoinHandle<()>>>,
     config_tx: tokio::sync::mpsc::UnboundedSender<ConfigUpdate>,
+    keyboard_mappings: Arc<RwLock<macrdp_input::KeyboardMappings>>,
+    keyboard_recording: Arc<Mutex<Option<u32>>>,
 }
 
 impl ServerHandle {
@@ -130,6 +132,15 @@ impl ServerHandle {
     /// Push a hot config update to the running server.
     pub fn update_config(&self, update: ConfigUpdate) {
         let _ = self.config_tx.send(update);
+    }
+
+    /// Apply mappings before returning; the active input handler reads this same list.
+    pub fn update_keyboard_mappings(&self, mappings: macrdp_input::KeyboardMappings) {
+        *self.keyboard_mappings.write().unwrap() = mappings;
+    }
+
+    pub fn set_keyboard_recording(&self, session: Option<u32>) {
+        *self.keyboard_recording.lock().unwrap() = session;
     }
 
     /// Gracefully stop the server.
@@ -186,6 +197,8 @@ struct ServerThreadArgs {
     shutdown_notify: Arc<Notify>,
     handler: Arc<dyn ServerEventHandler>,
     config_rx: tokio::sync::mpsc::UnboundedReceiver<ConfigUpdate>,
+    keyboard_mappings: Arc<RwLock<macrdp_input::KeyboardMappings>>,
+    keyboard_recording: Arc<Mutex<Option<u32>>>,
     perf_stats: Option<SharedPerfStats>,
     /// Hot-updatable capture frame rate (read by MacDisplay on each new connection).
     hot_fps: Arc<AtomicU32>,
@@ -358,6 +371,8 @@ async fn start_server_inner(
     let shutdown_notify = Arc::new(Notify::new());
     let (config_tx, config_rx) = tokio::sync::mpsc::unbounded_channel::<ConfigUpdate>();
     let hot_fps = Arc::new(AtomicU32::new(config.frame_rate));
+    let keyboard_mappings = Arc::new(RwLock::new(config.keyboard_mappings.clone()));
+    let keyboard_recording = Arc::new(Mutex::new(None));
     let stopped = Arc::new(AtomicBool::new(false));
 
     // Pack everything the server thread needs
@@ -376,6 +391,8 @@ async fn start_server_inner(
         shutdown_notify: Arc::clone(&shutdown_notify),
         handler: Arc::clone(&handler),
         config_rx,
+        keyboard_mappings: Arc::clone(&keyboard_mappings),
+        keyboard_recording: Arc::clone(&keyboard_recording),
         perf_stats,
         hot_fps: Arc::clone(&hot_fps),
     };
@@ -445,6 +462,8 @@ async fn start_server_inner(
         server_thread: Mutex::new(Some(server_thread)),
         metrics_task: Mutex::new(Some(metrics_task)),
         config_tx,
+        keyboard_mappings,
+        keyboard_recording,
     });
 
     Ok(handle)
@@ -494,7 +513,9 @@ fn run_server_thread(args: ServerThreadArgs) {
         };
 
         // Create input handler (clone coord_mapper — shared with display for resize sync)
-        let input_handler = MacInputHandler::new(args.coord_mapper.clone());
+        let input_handler = MacInputHandler::new(args.coord_mapper.clone())
+            .with_keyboard_mappings(args.keyboard_mappings)
+            .with_keyboard_recording(args.keyboard_recording, Arc::clone(&args.handler));
 
         // Audio setup — shared sender slot, recreated per connection by AudioFactory
         let shared_audio_tx = if args.config.audio.enabled {
@@ -666,6 +687,7 @@ fn run_server_thread(args: ServerThreadArgs) {
                 tracing::info!("Shutdown signal received, stopping server");
             }
         }
+        server.release_inputs().await;
     });
 }
 

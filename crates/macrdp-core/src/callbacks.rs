@@ -97,6 +97,14 @@ pub enum ConfigUpdate {
     Credentials { username: String, password: String },
 }
 
+/// Original remote input, emitted only while the mapping editor is recording.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordedKey {
+    pub session: u32,
+    pub key: Option<&'static str>,
+    pub pressed: bool,
+}
+
 /// Callback trait for receiving server events.
 /// All methods have default empty implementations so callers can override only what they need.
 pub trait ServerEventHandler: Send + Sync + 'static {
@@ -104,4 +112,5 @@ pub trait ServerEventHandler: Send + Sync + 'static {
     fn on_metrics(&self, _metrics: Metrics) {}
     fn on_connection(&self, _event: ConnectionEvent) {}
     fn on_log(&self, _entry: LogEntry) {}
+    fn on_recorded_key(&self, _key: RecordedKey) {}
 }

@@ -1,6 +1,7 @@
 use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
-use macrdp_input::{KeyboardInjector, MouseButton, MouseInjector};
-use std::sync::{Arc, Mutex};
+use macrdp_input::{KeyboardInjector, KeyboardMappings, MouseButton, MouseInjector};
+use std::sync::{Arc, Mutex, RwLock};
+use crate::callbacks::{RecordedKey, ServerEventHandler};
 
 /// Maps RDP desktop coordinates to macOS logical coordinates.
 ///
@@ -96,6 +97,10 @@ pub struct MacInputHandler {
     last_mouse_x: u16,
     last_mouse_y: u16,
     coord_mapper: MouseCoordMapper,
+    keyboard_mappings: Arc<RwLock<KeyboardMappings>>,
+    keyboard_recording: Arc<Mutex<Option<u32>>>,
+    recording_session: Option<u32>,
+    events: Option<Arc<dyn ServerEventHandler>>,
 }
 
 impl MacInputHandler {
@@ -119,17 +124,61 @@ impl MacInputHandler {
             last_mouse_x: 0,
             last_mouse_y: 0,
             coord_mapper,
+            keyboard_mappings: Arc::new(RwLock::new(KeyboardMappings::default())),
+            keyboard_recording: Arc::new(Mutex::new(None)),
+            recording_session: None,
+            events: None,
         }
+    }
+
+    pub fn with_keyboard_recording(
+        mut self,
+        recording: Arc<Mutex<Option<u32>>>,
+        events: Arc<dyn ServerEventHandler>,
+    ) -> Self {
+        self.keyboard_recording = recording;
+        self.events = Some(events);
+        self
+    }
+
+    pub fn with_keyboard_mappings(mut self, mappings: Arc<RwLock<KeyboardMappings>>) -> Self {
+        self.keyboard_mappings = mappings;
+        self
     }
 }
 
 impl RdpServerInputHandler for MacInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
+        let session = *self.keyboard_recording.lock().unwrap();
+        if session != self.recording_session {
+            if let Some(kb) = &mut self.keyboard {
+                if let Err(error) = kb.release_for_recording() {
+                    tracing::warn!(%error, "Failed to release keyboard input for recording");
+                }
+            }
+            self.recording_session = session;
+        }
+        if let Some(session) = session {
+            let (key, pressed) = match event {
+                KeyboardEvent::Pressed { code, extended } | KeyboardEvent::Released { code, extended } => {
+                    let scancode = u16::from(code) | if extended { 0x100 } else { 0 };
+                    let key = macrdp_input::KEY_OPTIONS.iter().find(|key| key.scancode == scancode);
+                    (key.map(|key| key.id), matches!(event, KeyboardEvent::Pressed { .. }))
+                }
+                KeyboardEvent::UnicodePressed(_) => (None, true),
+                KeyboardEvent::UnicodeReleased(_) => (None, false),
+                KeyboardEvent::Synchronize(_) => return,
+            };
+            if let Some(events) = &self.events {
+                events.on_recorded_key(RecordedKey { session, key, pressed });
+            }
+            return;
+        }
         let Some(kb) = &mut self.keyboard else { return };
 
         let result = match event {
-            KeyboardEvent::Pressed { code, extended } => kb.inject_key(code, extended, true),
-            KeyboardEvent::Released { code, extended } => kb.inject_key(code, extended, false),
+            KeyboardEvent::Pressed { code, extended } => kb.inject_mapped_key(code, extended, true, &self.keyboard_mappings.read().unwrap()),
+            KeyboardEvent::Released { code, extended } => kb.inject_mapped_key(code, extended, false, &self.keyboard_mappings.read().unwrap()),
             KeyboardEvent::UnicodePressed(ch) => kb.inject_unicode(ch, true),
             KeyboardEvent::UnicodeReleased(ch) => kb.inject_unicode(ch, false),
             KeyboardEvent::Synchronize(flags) => {
@@ -140,6 +189,14 @@ impl RdpServerInputHandler for MacInputHandler {
 
         if let Err(e) = result {
             tracing::warn!("Keyboard injection failed: {e}");
+        }
+    }
+
+    fn release_all(&mut self) {
+        if let Some(keyboard) = &mut self.keyboard {
+            if let Err(error) = keyboard.release_all() {
+                tracing::warn!(%error, "Failed to release keyboard input");
+            }
         }
     }
 
@@ -187,9 +244,48 @@ impl RdpServerInputHandler for MacInputHandler {
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_reports_original_remote_keys_before_mapping_or_injection() {
+        #[derive(Default)]
+        struct Events(Mutex<Vec<RecordedKey>>);
+        impl ServerEventHandler for Events {
+            fn on_recorded_key(&self, key: RecordedKey) {
+                self.0.lock().unwrap().push(key);
+            }
+        }
+        let events = Arc::new(Events::default());
+        let recording = Arc::new(Mutex::new(Some(7)));
+        // No native injectors are needed to capture input, and no events are posted.
+        let mut input = MacInputHandler {
+            keyboard: None, mouse: None, last_mouse_x: 0, last_mouse_y: 0,
+            coord_mapper: MouseCoordMapper::new(1920, 1080, 1920, 1080),
+            keyboard_mappings: Arc::new(RwLock::new(KeyboardMappings::default())),
+            keyboard_recording: Arc::clone(&recording), recording_session: None,
+            events: Some(events.clone()),
+        };
+        input.keyboard(KeyboardEvent::Pressed { code: 0x38, extended: false });
+        input.keyboard(KeyboardEvent::Pressed { code: 0x2E, extended: false });
+        input.keyboard(KeyboardEvent::Released { code: 0x2E, extended: false });
+        input.keyboard(KeyboardEvent::Released { code: 0x38, extended: false });
+        input.keyboard(KeyboardEvent::Pressed { code: 0x5C, extended: true });
+        input.keyboard(KeyboardEvent::UnicodePressed(0x41));
+        let recorded = events.0.lock().unwrap();
+        assert_eq!(recorded.iter().map(|key| key.key).collect::<Vec<_>>(),
+            [Some("left_alt"), Some("c"), Some("c"), Some("left_alt"), Some("right_meta"), None]);
+        assert!(recorded.iter().all(|key| key.session == 7));
+        assert!(recorded[0].pressed);
+        assert!(!recorded[2].pressed);
+        drop(recorded);
+        *recording.lock().unwrap() = None;
+        input.keyboard(KeyboardEvent::Pressed { code: 0x20, extended: false });
+        assert_eq!(events.0.lock().unwrap().len(), 6);
+    }
+
 
     #[test]
     fn mouse_mapping_excludes_bars_and_clamps_to_the_visible_desktop() {

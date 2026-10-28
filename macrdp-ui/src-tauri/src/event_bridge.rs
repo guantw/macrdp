@@ -30,6 +30,10 @@ impl TauriEventBridge {
 }
 
 impl ServerEventHandler for TauriEventBridge {
+    fn on_recorded_key(&self, key: macrdp_core::RecordedKey) {
+        let _ = self.app.emit_to("main", "recorded-key", key);
+    }
+
     fn on_status_change(&self, status: ServerStatus) {
         if let Some(state) = self.app.try_state::<Arc<AppState>>() {
             *state.status.lock().unwrap() = status.clone();

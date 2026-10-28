@@ -8,6 +8,7 @@ import type {
   ConnectionHistory,
   TrafficStats,
   UiConfig,
+  KeyOption,
 } from "./types";
 
 export const api = {
@@ -18,6 +19,8 @@ export const api = {
   getConnections: () => invoke<Connection[]>("get_connections"),
   getPermissions: () => invoke<PermissionStatus>("get_permissions"),
   getConfig: () => invoke<UiConfig>("get_config"),
+  getKeyboardKeys: () => invoke<KeyOption[]>("get_keyboard_keys"),
+  setKeyboardRecording: (session: number | null) => invoke<void>("set_keyboard_recording", { session }),
   setConfig: (key: string, value: unknown) =>
     invoke<{ restart_required: boolean }>("set_config", { key, value }),
   getLogs: (limit?: number) =>

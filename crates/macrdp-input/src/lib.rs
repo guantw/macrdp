@@ -2,10 +2,12 @@
 
 pub mod keyboard;
 pub mod keymap;
+pub mod mapping;
 pub mod mouse;
 
 pub use keyboard::KeyboardInjector;
 pub use keymap::scancode_to_keycode;
+pub use mapping::{KeyChord, KeyMapping, KeyOption, KeyboardMappings, Modifier, KEY_OPTIONS};
 pub use mouse::{MouseButton, MouseInjector};
 
 // FFI for Accessibility APIs

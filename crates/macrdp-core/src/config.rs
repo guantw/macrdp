@@ -88,6 +88,8 @@ pub struct ServerConfig {
     /// Clipboard synchronization configuration
     #[serde(default)]
     pub clipboard: ClipboardConfig,
+    /// Custom RDP key/chord mappings. Empty keeps the default macrdp keymap.
+    pub keyboard_mappings: macrdp_input::KeyboardMappings,
 }
 
 impl Default for ServerConfig {
@@ -113,6 +115,7 @@ impl Default for ServerConfig {
             max_qp: None,
             audio: AudioConfig::default(),
             clipboard: ClipboardConfig::default(),
+            keyboard_mappings: macrdp_input::KeyboardMappings::default(),
         }
     }
 }

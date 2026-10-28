@@ -348,6 +348,17 @@ impl RdpServer {
     }
 
     pub async fn run_connection(&mut self, stream: TcpStream) -> Result<()> {
+        let result = self.run_connection_inner(stream).await;
+        self.release_inputs().await;
+        result
+    }
+
+    /// Also called when the owner cancels the server during an active connection.
+    pub async fn release_inputs(&self) {
+        self.handler.lock().await.release_all();
+    }
+
+    async fn run_connection_inner(&mut self, stream: TcpStream) -> Result<()> {
         let peer_ip = stream.peer_addr().map(|addr| addr.ip()).ok();
         // SVC chunks are only 1600 bytes; Nagle would batch them and add latency to every frame.
         if let Err(e) = stream.set_nodelay(true) {
