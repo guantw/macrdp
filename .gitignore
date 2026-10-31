@@ -33,3 +33,4 @@ macrdp-ui/dist/
 # Misc
 *.git.bak/
 **/.git.bak/
+.openbitfun/
