@@ -500,7 +500,9 @@ impl GfxHandler {
             ));
         }
 
-        let aux_len = frame.h264_aux.as_ref().map_or(0, |a| a.len());
+        let aux = frame.h264_aux.as_ref()
+            .filter(|_| frame.avc444 && state.avc444_supported && state.avc444_enabled);
+        let aux_len = aux.map_or(0, |data| data.len());
         // One allocation for the whole segmented frame: ZGFX header slot + setup/frame PDUs + payload.
         let mut out = Vec::with_capacity(ZGFX_SINGLE_HEADER + frame.h264_data.len() + aux_len + 256);
         out.extend_from_slice(&[0; ZGFX_SINGLE_HEADER]);
@@ -512,6 +514,9 @@ impl GfxHandler {
             );
         }
 
+        // The producer may already be preparing a later frame. Account for the
+        // payload being packetized here, including only the aux view sent below.
+        state.last_frame_bytes = (frame.h264_data.len() + aux_len) as u32;
         let frame_id = state.next_frame_id();
         push_pdu(&mut out, &ServerPdu::StartFrame(StartFramePdu {
             timestamp: Timestamp { milliseconds: 0, seconds: 0, minutes: 0, hours: 0 },
@@ -524,7 +529,7 @@ impl GfxHandler {
 
         // Choose AVC444 or AVC420 path based on the frame and negotiated caps. Without client
         // AVC444 the Main View alone is a valid AVC420 stream.
-        match frame.h264_aux.as_ref().filter(|_| frame.avc444 && state.avc444_supported && state.avc444_enabled) {
+        match aux {
             Some(aux) => {
                 let stream = Avc444BitmapStream {
                     encoding: Encoding::LUMA_AND_CHROMA,
@@ -1174,6 +1179,8 @@ mod tests {
             avc444: false,
             h264_aux: None,
         };
+        // A prefetched update may have overwritten the producer's latest size.
+        s.last_frame_bytes = 4;
         let data = GfxHandler::create_frame_pdu(&mut s, &frame).unwrap();
         assert_eq!(data[0], ZGFX_MULTIPART);
         let pdus = decode_all(&unwrap_zgfx(&data).unwrap());
@@ -1190,12 +1197,47 @@ mod tests {
         }
         assert_eq!(s.frame_id, 1);
         assert!(s.surface_created);
+        assert_eq!(s.last_frame_bytes, 70_000);
+        assert_eq!(s.total_bytes_sent, 70_000);
 
         // Second frame: no surface setup, single segment.
         let small = GfxFrameUpdate { h264_data: Bytes::from_static(&[1, 2, 3]), is_keyframe: false, ..frame };
         let data = GfxHandler::create_frame_pdu(&mut s, &small).unwrap();
         assert_eq!(&data[..2], &[ZGFX_SINGLE, ZGFX_UNCOMPRESSED]);
         assert_eq!(decode_all(&data[2..]).len(), 3);
+        assert_eq!(s.last_frame_bytes, 3);
+        assert_eq!(s.total_bytes_sent, 70_003);
+
+        // Count the auxiliary payload only when it is included in the frame PDU.
+        let dual = GfxFrameUpdate {
+            avc444: true,
+            h264_aux: Some(Bytes::from_static(&[4, 5])),
+            ..small
+        };
+        for enabled in [true, false] {
+            s.avc444_enabled = enabled;
+            s.last_frame_bytes = 1234;
+            let previous_total = s.total_bytes_sent;
+            let data = GfxHandler::create_frame_pdu(&mut s, &dual).unwrap();
+            let pdus = decode_all(&unwrap_zgfx(&data).unwrap());
+            let ServerPdu::WireToSurface1(wire) = &pdus[1] else {
+                panic!("expected WireToSurface1");
+            };
+            let payload_bytes = if enabled {
+                assert_eq!(wire.codec_id, Codec1Type::Avc444);
+                let stream = decode::<Avc444BitmapStream<'_>>(&wire.bitmap_data).unwrap();
+                assert_eq!(stream.stream1.data, &[1, 2, 3]);
+                assert_eq!(stream.stream2.unwrap().data, &[4, 5]);
+                5
+            } else {
+                assert_eq!(wire.codec_id, Codec1Type::Avc420);
+                let stream = decode::<Avc420BitmapStream<'_>>(&wire.bitmap_data).unwrap();
+                assert_eq!(stream.data, &[1, 2, 3]);
+                3
+            };
+            assert_eq!(s.last_frame_bytes, payload_bytes);
+            assert_eq!(s.total_bytes_sent - previous_total, u64::from(payload_bytes));
+        }
     }
 
     #[test]
