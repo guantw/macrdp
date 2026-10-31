@@ -31,7 +31,7 @@ use tracing::{debug, error, info, trace, warn};
 use {ironrdp_dvc as dvc, ironrdp_rdpsnd as rdpsnd};
 
 use crate::clipboard::CliprdrServerFactory;
-use crate::display::{DisplayUpdate, RdpServerDisplay};
+use crate::display::{DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates};
 use crate::encoder::{UpdateEncoder, UpdateEncoderCodecs};
 use crate::gfx::{GfxHandler, GfxState};
 use crate::handler::RdpServerInputHandler;
@@ -666,6 +666,65 @@ impl RdpServer {
         Ok((RunState::Continue, encoder))
     }
 
+    /// Prepare at most one update ahead of the writer. Reserving the slot before
+    /// `next_update` bounds encoding work as well as queued output; encoded H.264
+    /// frames must reach the client in order to preserve their reference chain.
+    async fn dispatch_display_updates(
+        mut display_updates: Box<dyn RdpServerDisplayUpdates>,
+        writer: &mut impl FramedWrite,
+        user_channel_id: u16,
+        io_channel_id: u16,
+        mut encoder: UpdateEncoder,
+        gfx_state: &Arc<std::sync::Mutex<GfxState>>,
+        drdynvc_channel_id: Option<StaticChannelId>,
+    ) -> Result<RunState> {
+        let (tx, mut rx) = mpsc::channel(1);
+        let prepare = async move {
+            while let Ok(slot) = tx.reserve().await {
+                match display_updates.next_update().await {
+                    Ok(Some(update)) => {
+                        let resize = matches!(&update, DisplayUpdate::Resize(_));
+                        slot.send(update);
+                        // Reactivation creates a new display stream. Do not prepare
+                        // output against the old surface after the resize boundary.
+                        if resize {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => warn!(error = format!("{error:#}"), "next_update failed"),
+                }
+            }
+        };
+        let send = async move {
+            let mut buffer = vec![0u8; 4096];
+            while let Some(update) = rx.recv().await {
+                // Freeing the slot lets the producer start the next blocking encode
+                // before we pack this update, even if socket writes complete at once.
+                tokio::task::yield_now().await;
+                let (state, enc) = Self::dispatch_display_update(
+                    update, writer, user_channel_id, io_channel_id,
+                    &mut buffer, encoder, gfx_state, drdynvc_channel_id,
+                ).await?;
+                match state {
+                    RunState::Continue => encoder = enc,
+                    state => return Ok(state),
+                }
+            }
+            Ok(RunState::Disconnect)
+        };
+
+        // Keep both futures inside the connection: a failed write or disconnect
+        // drops the display stream and queued output, without a detached producer.
+        tokio::pin!(prepare, send);
+        tokio::select! {
+            biased;
+            // End of input still drains the queued update (including Resize).
+            () = &mut prepare => send.await,
+            result = &mut send => result,
+        }
+    }
+
     async fn dispatch_server_events(
         &mut self,
         events: &mut Vec<ServerEvent>,
@@ -787,14 +846,14 @@ impl RdpServer {
         writer: &mut Framed<W>,
         io_channel_id: u16,
         user_channel_id: u16,
-        mut encoder: UpdateEncoder,
+        encoder: UpdateEncoder,
     ) -> Result<RunState>
     where
         R: FramedRead,
         W: FramedWrite,
     {
         debug!("Starting client loop");
-        let mut display_updates = self.display.lock().await.updates().await
+        let display_updates = self.display.lock().await.updates().await
             .context("failed to initialize display after authentication")?;
         let mut writer = SharedWriter::new(writer);
         let mut display_writer = writer.clone();
@@ -830,42 +889,10 @@ impl RdpServer {
             }
         };
 
-        let dispatch_display = async move {
-            let mut buffer = vec![0u8; 4096];
-
-            loop {
-                match display_updates.next_update().await {
-                    Ok(Some(update)) => {
-                        match Self::dispatch_display_update(
-                            update,
-                            &mut display_writer,
-                            user_channel_id,
-                            io_channel_id,
-                            &mut buffer,
-                            encoder,
-                            &gfx_state,
-                            drdynvc_channel_id,
-                        )
-                        .await?
-                        {
-                            (RunState::Continue, enc) => {
-                                encoder = enc;
-                                continue;
-                            }
-                            (state, _) => {
-                                break Ok(state);
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        break Ok(RunState::Disconnect);
-                    }
-                    Err(error) => {
-                        warn!(error = format!("{error:#}"), "next_updated failed");
-                    }
-                }
-            }
-        };
+        let dispatch_display = Self::dispatch_display_updates(
+            display_updates, &mut display_writer, user_channel_id, io_channel_id,
+            encoder, &gfx_state, drdynvc_channel_id,
+        );
 
         let this = Rc::clone(&s);
         let mut ev_receiver = ev_receiver.lock().await;
@@ -1310,8 +1337,12 @@ impl<'a, W: FramedWrite> SharedWriter<'a, W> {
 mod tests {
     use super::*;
     use std::num::{NonZeroU16, NonZeroUsize};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
     use bytes::Bytes;
+    use ironrdp_core::{decode_cursor, ReadCursor};
+    use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdatePdu};
+    use ironrdp_pdu::pointer::PointerPositionAttribute;
     use crate::{BitmapUpdate, GfxFrameUpdate, GfxUncompressedUpdate, PixelFormat, UncompressedRect};
 
     struct TestWriter {
@@ -1330,6 +1361,162 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    struct PipelineUpdates {
+        updates: mpsc::UnboundedReceiver<DisplayUpdate>,
+        calls: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl RdpServerDisplayUpdates for PipelineUpdates {
+        async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.updates.recv().await)
+        }
+    }
+
+    impl Drop for PipelineUpdates {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct ControlledWriter {
+        writes: mpsc::UnboundedSender<Vec<u8>>,
+        results: mpsc::UnboundedReceiver<std::io::Result<()>>,
+    }
+
+    impl FramedWrite for ControlledWriter {
+        type WriteAllFut<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + 'a>>;
+
+        fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Self::WriteAllFut<'a> {
+            Box::pin(async move {
+                self.writes.send(buf.to_vec()).unwrap();
+                self.results.recv().await.unwrap()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn display_pipeline_overlaps_one_update_and_drains_in_order() {
+        let (input, updates) = mpsc::unbounded_channel();
+        for x in 1..=3 {
+            input.send(DisplayUpdate::PointerPosition(PointerPositionAttribute {
+                x, y: 0,
+            })).unwrap();
+        }
+        drop(input);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let updates = Box::new(PipelineUpdates {
+            updates, calls: Arc::clone(&calls), dropped: Arc::clone(&dropped),
+        });
+        let (writes, mut wire) = mpsc::unbounded_channel();
+        let (complete, results) = mpsc::unbounded_channel();
+        let mut writer = ControlledWriter { writes, results };
+        let gfx = Arc::new(std::sync::Mutex::new(GfxState::new(64, 48, false)));
+        let encoder = UpdateEncoder::new(
+            DesktopSize { width: 64, height: 48 },
+            CmdFlags::empty(), UpdateEncoderCodecs::new(),
+        ).unwrap();
+        let pipeline = RdpServer::dispatch_display_updates(
+            updates, &mut writer, 1001, 1003, encoder, &gfx, None,
+        );
+        let probe = async {
+            for x in 1..=3 {
+                let bytes = wire.recv().await.unwrap();
+                let mut cursor = ReadCursor::new(&bytes);
+                let _: FastPathHeader = decode_cursor(&mut cursor).unwrap();
+                let update: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).unwrap();
+                let position: PointerPositionAttribute = decode(update.data).unwrap();
+                assert_eq!(position.x, x, "updates must retain their order");
+                // Preparing the next update starts before the current write, even
+                // when this test allows the write to finish immediately afterwards.
+                assert_eq!(calls.load(Ordering::SeqCst), x as usize + 1);
+                if x == 1 {
+                    // Keep the first write blocked across scheduler turns. A full
+                    // slot must stop preparation before a third next_update call.
+                    for _ in 0..3 {
+                        tokio::task::yield_now().await;
+                    }
+                    assert_eq!(calls.load(Ordering::SeqCst), 2);
+                    assert!(wire.try_recv().is_err());
+                }
+                complete.send(Ok(())).unwrap();
+            }
+        };
+        let (state, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(pipeline, probe)
+        }).await.expect("display pipeline stalled");
+        assert!(matches!(state.unwrap(), RunState::Disconnect));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn display_pipeline_stops_preparing_at_resize() {
+        let (input, updates) = mpsc::unbounded_channel();
+        input.send(DisplayUpdate::Resize(DesktopSize { width: 80, height: 60 })).unwrap();
+        input.send(DisplayUpdate::HidePointer).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let updates = Box::new(PipelineUpdates {
+            updates, calls: Arc::clone(&calls), dropped: Arc::clone(&dropped),
+        });
+        let gfx = Arc::new(std::sync::Mutex::new(GfxState::new(64, 48, false)));
+        let encoder = UpdateEncoder::new(
+            DesktopSize { width: 64, height: 48 },
+            CmdFlags::empty(), UpdateEncoderCodecs::new(),
+        ).unwrap();
+        let mut writer = TestWriter { fail: false, bytes: 0 };
+        let state = tokio::time::timeout(Duration::from_secs(5), RdpServer::dispatch_display_updates(
+            updates, &mut writer, 1001, 1003, encoder, &gfx, None,
+        )).await.unwrap().unwrap();
+        assert!(matches!(state, RunState::DeactivationReactivation {
+            desktop_size: DesktopSize { width: 80, height: 60 },
+        }));
+        assert!(writer.bytes > 0, "resize must send deactivation before returning");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(input.is_closed());
+    }
+
+    #[tokio::test]
+    async fn display_pipeline_cancels_pending_preparation_on_write_failure() {
+        let (input, updates) = mpsc::unbounded_channel();
+        input.send(DisplayUpdate::PointerPosition(PointerPositionAttribute {
+            x: 1, y: 0,
+        })).unwrap();
+        // Keep input open: the second next_update must remain pending until
+        // the failed write cancels and drops the display stream.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let updates = Box::new(PipelineUpdates {
+            updates, calls: Arc::clone(&calls), dropped: Arc::clone(&dropped),
+        });
+        let (writes, mut wire) = mpsc::unbounded_channel();
+        let (complete, results) = mpsc::unbounded_channel();
+        let mut writer = ControlledWriter { writes, results };
+        let gfx = Arc::new(std::sync::Mutex::new(GfxState::new(64, 48, false)));
+        let encoder = UpdateEncoder::new(
+            DesktopSize { width: 64, height: 48 },
+            CmdFlags::empty(), UpdateEncoderCodecs::new(),
+        ).unwrap();
+        let pipeline = RdpServer::dispatch_display_updates(
+            updates, &mut writer, 1001, 1003, encoder, &gfx, None,
+        );
+        let probe = async {
+            wire.recv().await.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            complete.send(Err(std::io::ErrorKind::BrokenPipe.into())).unwrap();
+        };
+        let (state, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(pipeline, probe)
+        }).await.expect("failed writer left display preparation running");
+        assert!(state.is_err());
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(input.is_closed());
     }
 
     #[tokio::test]

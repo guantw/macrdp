@@ -1141,9 +1141,9 @@ impl MacDisplayUpdates {
             // Taken here; re-armed below if the encode produces nothing, so the IDR is not lost.
             let mut force_kf = std::mem::replace(&mut self.keyframe_requested, false);
 
-            // Synchronous encode on the blocking pool — no pipelining: a one-frame pipeline
-            // costs a fixed 1/fps of latency and makes encode_ms measure the frame interval,
-            // which the bitrate controller then reads as permanent overload.
+            // One encode at a time on the blocking pool. The server can send the
+            // previous update meanwhile; encode_ms excludes the outgoing queue wait
+            // so adaptive capture pacing still measures the encoder work itself.
             if self.encoder.is_some() {
                 self.display_frame_count += 1;
                 let cache = CachedFrame::from_frame(&frame);
