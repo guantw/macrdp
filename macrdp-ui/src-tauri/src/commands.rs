@@ -295,6 +295,9 @@ pub fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("main") {
         window.show().map_err(|e: tauri::Error| e.to_string())?;
         window
+            .unminimize()
+            .map_err(|e: tauri::Error| e.to_string())?;
+        window
             .set_focus()
             .map_err(|e: tauri::Error| e.to_string())?;
     }

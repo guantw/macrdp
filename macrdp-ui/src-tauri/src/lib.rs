@@ -33,11 +33,11 @@ pub fn run() {
 
     tracing::info!("macrdp-ui starting...");
 
-    tauri::Builder::default()
+    let mut app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // Focus main window when a second instance is launched
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.set_focus();
+            // Restore the main window when a second instance is launched.
+            if let Err(error) = commands::show_main_window(app.clone()) {
+                tracing::warn!(%error, "Failed to restore main window");
             }
         }))
         .plugin(tauri_plugin_autostart::init(
@@ -121,6 +121,12 @@ pub fn run() {
             commands::quit_app,
             commands::set_autostart,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running macrdp-ui");
+        .build(tauri::generate_context!())
+        .expect("error while building macrdp-ui");
+
+    // Set the runtime policy before launch so it does not override LSUIElement.
+    #[cfg(target_os = "macos")]
+    app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+    app.run(|_, _| {});
 }
