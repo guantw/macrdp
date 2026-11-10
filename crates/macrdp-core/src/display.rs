@@ -55,6 +55,8 @@ pub struct MacDisplay {
     perf_stats: Option<SharedPerfStats>,
     /// Hot-updatable frame rate (written by the config task, read per connection)
     hot_fps: Arc<AtomicU32>,
+    /// Stop the service when sharing is cancelled from the macOS menu bar.
+    stop_requested: Arc<tokio::sync::Notify>,
 }
 
 impl MacDisplay {
@@ -72,6 +74,7 @@ impl MacDisplay {
         shared_audio_tx: Option<SharedAudioTx>,
         perf_stats: Option<SharedPerfStats>,
         hot_fps: Arc<AtomicU32>,
+        stop_requested: Arc<tokio::sync::Notify>,
     ) -> Self {
         let base_bitrate = bitrate_override
             .unwrap_or_else(|| macrdp_encode::screen_bitrate(width as u32, height as u32, frame_rate as f32, quality));
@@ -91,6 +94,7 @@ impl MacDisplay {
             shared_audio_tx,
             perf_stats,
             hot_fps,
+            stop_requested,
         }
     }
 }
@@ -212,7 +216,9 @@ impl RdpServerDisplay for MacDisplay {
         // Read the current audio sender from the shared slot (set by AudioFactory per connection)
         let audio_tx = self.shared_audio_tx.as_ref()
             .and_then(|shared| shared.lock().unwrap().clone());
-        let capturer = ScreenCapturer::new_when_display_ready(capture_config.clone(), audio_tx).await?;
+        let capturer = ScreenCapturer::new_when_display_ready(
+            capture_config.clone(), audio_tx, Arc::clone(&self.stop_requested),
+        ).await?;
 
         let (peer_addr, max_pointer, suppress_notify) = {
             let gfx = self.gfx_state.lock().unwrap();
@@ -251,6 +257,7 @@ impl RdpServerDisplay for MacDisplay {
             last_full_uncompressed: None,
             last_sck_retry: None,
             shared_audio_tx: self.shared_audio_tx.clone(),
+            stop_requested: Arc::clone(&self.stop_requested),
             suppressed: false,
             suppress_notify,
             cache_unsent: false,
@@ -367,6 +374,7 @@ struct MacDisplayUpdates {
     last_sck_retry: Option<Instant>,
     /// Audio sender slot, re-read on every capturer rebuild so audio survives SCStream restarts.
     shared_audio_tx: Option<SharedAudioTx>,
+    stop_requested: Arc<tokio::sync::Notify>,
     /// Mirror of `GfxState::output_suppressed` as last seen by this stream (edge detection).
     suppressed: bool,
     /// `GfxState::suppress_notify`: wakes the suppressed wait as soon as the client allows
@@ -644,7 +652,9 @@ impl MacDisplayUpdates {
     /// (1 fps while suppressed, else the adaptive `last_applied_fps`).
     async fn new_capturer(&mut self) -> Result<ScreenCapturer> {
         let audio_tx = self.shared_audio_tx.as_ref().and_then(|shared| shared.lock().unwrap().clone());
-        let capturer = ScreenCapturer::new(self.capture_config.clone(), audio_tx).await?;
+        let capturer = ScreenCapturer::new(
+            self.capture_config.clone(), audio_tx, Arc::clone(&self.stop_requested),
+        ).await?;
         let fps = if self.suppressed { 1 } else { self.last_applied_fps };
         if fps != self.capture_config.frame_rate {
             if let Err(e) = set_fps_with_timeout(&capturer, fps).await {
@@ -1429,6 +1439,7 @@ mod tests {
             shared_audio_tx: None,
             perf_stats: None,
             hot_fps: Arc::new(AtomicU32::new(30)),
+            stop_requested: Arc::new(tokio::sync::Notify::new()),
         };
         display.set_resolution("5120x2880");
         assert_eq!(display.size().await, DesktopSize { width: 5120, height: 2880 });

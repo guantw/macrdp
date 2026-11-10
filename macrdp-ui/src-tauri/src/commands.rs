@@ -25,9 +25,15 @@ pub async fn start_server(
 
     // Serialize the full operation so two windows cannot start duplicate servers.
     let mut guard = state.server_handle.lock().await;
-    if guard.is_some() {
-        tracing::info!("Server already running");
-        return Ok(state.status.lock().unwrap().clone());
+    if let Some(handle) = guard.as_ref() {
+        if handle.status().running {
+            tracing::info!("Server already running");
+            return Ok(state.status.lock().unwrap().clone());
+        }
+        // System Stop Sharing ends the server without going through this command.
+        // Reap its handle before allowing the user to start sharing again.
+        handle.stop().await.map_err(|e| format!("Failed to stop server: {e}"))?;
+        *guard = None;
     }
 
     // Load configuration from UI config

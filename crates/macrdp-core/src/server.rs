@@ -401,17 +401,22 @@ async fn start_server_inner(
     // RdpServer is !Send (contains dyn SoundServerFactory, dyn CliprdrServerFactory),
     // so we construct and run it entirely within this thread.
     let thread_stopped = Arc::clone(&stopped);
+    let handler_for_thread = Arc::clone(&handler);
     let server_thread = std::thread::Builder::new()
         .name("rdp-server".into())
         .spawn(move || {
-            run_server_thread(args);
+            let shutdown_requested = run_server_thread(args);
             // Any exit (TLS error, server.run() error, shutdown) means we are no longer running.
             thread_stopped.store(true, Ordering::Relaxed);
+            if shutdown_requested {
+                handler_for_thread.on_status_change(ServerStatus::default());
+            }
         })
         .context("Failed to spawn RDP server thread")?;
 
     // Spawn metrics ticker (1 second interval) — all types here are Send
     let metrics_gfx = Arc::clone(&gfx_state);
+    let metrics_stopped = Arc::clone(&stopped);
     let handler_for_metrics = Arc::clone(&handler);
     let metrics_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -420,6 +425,10 @@ async fn start_server_inner(
         let mut prev_bytes_sent: u64 = 0;
         loop {
             interval.tick().await;
+            if metrics_stopped.load(Ordering::Relaxed) {
+                handler_for_metrics.on_metrics(Metrics::default());
+                break;
+            }
             let (fps, rtt_ms, bytes_sent, encode_ms, last_frame_bytes, network_quality, pending_acks) = {
                 let mut gfx = metrics_gfx.lock().unwrap();
                 (
@@ -473,8 +482,8 @@ async fn start_server_inner(
 
 /// Runs the RDP server entirely on the current thread. Called from the dedicated
 /// server thread. Constructs the !Send RdpServer here so it never crosses thread
-/// boundaries.
-fn run_server_thread(args: ServerThreadArgs) {
+/// boundaries. Returns whether it exited in response to a stop request.
+fn run_server_thread(args: ServerThreadArgs) -> bool {
     use crate::display::MacDisplay;
     use crate::handler::MacInputHandler;
     use ironrdp_server::{Credentials, RdpServer, TlsIdentityCtx};
@@ -498,7 +507,7 @@ fn run_server_thread(args: ServerThreadArgs) {
                     state: "error".to_string(),
                     uptime_secs: 0,
                 });
-                return;
+                return false;
             }
         };
         let tls_acceptor = match tls_identity.make_acceptor() {
@@ -510,7 +519,7 @@ fn run_server_thread(args: ServerThreadArgs) {
                     state: "error".to_string(),
                     uptime_secs: 0,
                 });
-                return;
+                return false;
             }
         };
 
@@ -572,6 +581,7 @@ fn run_server_thread(args: ServerThreadArgs) {
             shared_audio_tx,
             args.perf_stats,
             Arc::clone(&args.hot_fps),
+            Arc::clone(&args.shutdown_notify),
         );
 
         // Build RDP server (this is the !Send type)
@@ -674,7 +684,12 @@ fn run_server_thread(args: ServerThreadArgs) {
             }
         });
 
-        tokio::select! {
+        let shutdown_requested = tokio::select! {
+            biased;
+            _ = args.shutdown_notify.notified() => {
+                tracing::info!("Shutdown signal received, stopping server");
+                true
+            }
             result = server.run() => {
                 if let Err(e) = result {
                     tracing::error!("RDP server error: {e}");
@@ -684,13 +699,12 @@ fn run_server_thread(args: ServerThreadArgs) {
                         uptime_secs: 0,
                     });
                 }
+                false
             }
-            _ = args.shutdown_notify.notified() => {
-                tracing::info!("Shutdown signal received, stopping server");
-            }
-        }
+        };
         server.release_inputs().await;
-    });
+        shutdown_requested
+    })
 }
 
 #[cfg(test)]

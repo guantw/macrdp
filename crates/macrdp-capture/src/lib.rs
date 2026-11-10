@@ -7,10 +7,11 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use core_graphics::access::ScreenCaptureAccess;
 use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
+use screencapturekit::error::SCStreamErrorCode;
 use screencapturekit::prelude::*;
 use screencapturekit::stream::configuration::{AudioChannelCount, AudioSampleRate};
 use screencapturekit::stream::delegate_trait::SCStreamDelegateTrait;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 /// Check if Screen Recording permission is granted (no prompt)
 pub fn check_screen_recording_permission() -> bool {
@@ -374,18 +375,28 @@ struct VideoOutputHandler {
 
 struct CaptureDelegate {
     slot: Arc<LatestSlot<CaptureOutput>>,
+    stop_requested: Arc<Notify>,
 }
 
 impl SCStreamDelegateTrait for CaptureDelegate {
     fn did_stop_with_error(&self, error: SCError) {
-        tracing::warn!(%error, "Screen capture stopped");
-        self.slot.close();
+        if error.stream_error_code() == Some(SCStreamErrorCode::UserStopped) {
+            tracing::info!("Screen sharing stopped by user");
+            // Let the owner stop the service. Closing the slot here would instead
+            // trigger CoreGraphics capture and rebuild the stream the user stopped.
+            self.stop_requested.notify_one();
+        } else {
+            tracing::warn!(%error, "Screen capture stopped");
+            self.slot.close();
+        }
     }
 
-    fn stream_did_stop(&self, _error: Option<String>) {
-        // Wake next_frame so the display layer can run its existing fallback/rebuild
-        // path. Without this, a stopped stream leaves it waiting forever for a frame.
-        self.slot.close();
+    fn stream_did_stop(&self, error: Option<String>) {
+        // The error callback is followed by this string-only callback for the same
+        // stop. Only the typed callback can distinguish cancellation from recovery.
+        if error.is_none() {
+            self.slot.close();
+        }
     }
 }
 
@@ -706,12 +717,15 @@ impl ScreenCapturer {
     ///
     /// If `audio_tx` is `Some`, audio capture is enabled and frames are sent
     /// to the provided channel as `AudioFrame` (interleaved Float32 PCM, 48 kHz stereo).
+    /// The owner must handle `stop_requested` by stopping sharing when the user
+    /// presses the system's Stop Sharing button.
     pub async fn new(
         config: CaptureConfig,
         audio_tx: Option<mpsc::Sender<AudioFrame>>,
+        stop_requested: Arc<Notify>,
     ) -> Result<Self> {
         let display = query_display().await?.context("No display found")?;
-        Self::for_display(config, audio_tx, display).await
+        Self::for_display(config, audio_tx, stop_requested, display).await
     }
 
     /// Initial connection after the authenticated session requests display wake.
@@ -720,14 +734,16 @@ impl ScreenCapturer {
     pub async fn new_when_display_ready(
         config: CaptureConfig,
         audio_tx: Option<mpsc::Sender<AudioFrame>>,
+        stop_requested: Arc<Notify>,
     ) -> Result<Self> {
         let display = wait_for_display(query_display, std::time::Duration::from_secs(5)).await?;
-        Self::for_display(config, audio_tx, display).await
+        Self::for_display(config, audio_tx, stop_requested, display).await
     }
 
     async fn for_display(
         config: CaptureConfig,
         audio_tx: Option<mpsc::Sender<AudioFrame>>,
+        stop_requested: Arc<Notify>,
         display: SCDisplay,
     ) -> Result<Self> {
 
@@ -798,7 +814,7 @@ impl ScreenCapturer {
         let mut stream = SCStream::new_with_delegate(
             &filter,
             &stream_config,
-            CaptureDelegate { slot: Arc::clone(&slot) },
+            CaptureDelegate { slot: Arc::clone(&slot), stop_requested },
         );
         stream.add_output_handler(video_handler, SCStreamOutputType::Screen);
 
@@ -1126,21 +1142,39 @@ mod tests {
         assert!(error.to_string().contains("Timed out querying"));
     }
 
-    #[tokio::test]
-    async fn capture_stop_notifies_the_display_recovery_loop() {
-        for with_error in [false, true] {
+    #[tokio::test(start_paused = true)]
+    async fn capture_stop_distinguishes_user_cancellation_from_recovery() {
+        for (error, user_stopped) in [
+            (None, false),
+            (Some(SCError::StreamError("display disconnected".into())), false),
+            (Some(SCError::from_stream_error_code_with_message(
+                SCStreamErrorCode::UserStopped, "用户已停止流播放",
+            )), true),
+        ] {
             let slot = Arc::new(LatestSlot::default());
-            let receiver = Arc::clone(&slot);
-            let waiter = tokio::spawn(async move { receiver.take().await });
-            tokio::task::yield_now().await;
-            let delegate = CaptureDelegate { slot };
-            if with_error {
-                delegate.did_stop_with_error(SCError::StreamError("display disconnected".into()));
+            let stop_requested = Arc::new(Notify::new());
+            let delegate = CaptureDelegate {
+                slot: Arc::clone(&slot),
+                stop_requested: Arc::clone(&stop_requested),
+            };
+            if let Some(error) = error {
+                let message = error.to_string();
+                delegate.did_stop_with_error(error);
+                // ScreenCaptureKit's binding delivers both callbacks for one stop.
+                delegate.stream_did_stop(Some(message));
             } else {
                 delegate.stream_did_stop(None);
             }
-            assert!(tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
-                .await.unwrap().unwrap().is_none());
+            let timeout = std::time::Duration::from_secs(1);
+            if user_stopped {
+                tokio::time::timeout(timeout, stop_requested.notified()).await.unwrap();
+                assert!(tokio::time::timeout(timeout, slot.take()).await.is_err(),
+                    "user cancellation must not wake the capture recovery path");
+            } else {
+                assert!(tokio::time::timeout(timeout, slot.take()).await.unwrap().is_none());
+                assert!(tokio::time::timeout(timeout, stop_requested.notified()).await.is_err(),
+                    "recoverable capture stops must not stop the server");
+            }
         }
     }
 
@@ -1275,6 +1309,7 @@ mod tests {
         let mut cap = ScreenCapturer::new(
             CaptureConfig { width: 0, height: 0, frame_rate: 30, pixel_format: CapturePixelFormat::Nv12Full, show_cursor: false },
             None,
+            Arc::new(Notify::new()),
         ).await.unwrap();
         let before = next_pixel_frame(&mut cap).await;
         assert_eq!(before.0, u32::from_be_bytes(*b"420f"), "initial frame is not NV12 420f");
